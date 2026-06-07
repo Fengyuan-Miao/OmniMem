@@ -1,0 +1,4 @@
+FROM qwen3-vl:8b-instruct
+
+PARAMETER num_ctx 8192
+PARAMETER temperature 0

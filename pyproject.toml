@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnimem"
+version = "0.1.0"
+description = "Multimodal long-term memory with unified and dual-encoder retrieval."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faiss-cpu>=1.7.4",
+    "numpy>=1.24",
+    "Pillow>=10",
+]
+
+[project.optional-dependencies]
+dual = [
+    "sentence-transformers>=3",
+    "torch>=2.1",
+    "transformers>=4.45",
+]
+gme = [
+    "requests>=2.31",
+    "torch>=2.1",
+    "tqdm>=4.66",
+    "transformers>=4.45",
+]
+all = [
+    "requests>=2.31",
+    "sentence-transformers>=3",
+    "torch>=2.1",
+    "tqdm>=4.66",
+    "transformers>=4.45",
+]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+omnimem = "omnimem.cli:main"
+omnimem-memgallery-gme = "memgallery_gme_pipeline:main"
+omnimem-memgallery-dual = "memgallery_dual_encoder_pipeline:main"
+omnimem-memgallery-topic = "topic_memory.memgallery_topic_pipeline:main"
+omnimem-memgallery-svi = "memgallery_svi_pipeline:main"
+
+[tool.setuptools]
+py-modules = [
+    "memgallery_dual_encoder_pipeline",
+    "memgallery_gme_pipeline",
+    "memgallery_svi_pipeline",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "omnimem*",
+    "dual_encoder_memory*",
+    "gme_memory*",
+    "svi_omnimem*",
+    "topic_memory*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
