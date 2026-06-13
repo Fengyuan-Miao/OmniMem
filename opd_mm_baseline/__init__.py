@@ -20,6 +20,7 @@ from .models import (
     SFTExample,
     ToolAction,
 )
+from .online import OnlineDistillationBuffer, OnlineSelfDistiller
 from .retrieval import HiddenMemoryStore, HybridRetriever
 from .schema import TOOL_SCHEMA_TEXT, TrajectoryValidator, build_tool_schema
 from .training import OnPolicyDistiller
@@ -35,6 +36,8 @@ __all__ = [
     "InteractiveTeacherSearch",
     "MemoryRecord",
     "OnPolicyDistiller",
+    "OnlineDistillationBuffer",
+    "OnlineSelfDistiller",
     "OPDRollout",
     "OPDSample",
     "PolicyOutput",

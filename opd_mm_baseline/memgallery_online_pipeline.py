@@ -1,0 +1,450 @@
+"""Online self-distillation runner for interactive OPD-MM on Mem-Gallery."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from dual_encoder_memory import MiniLMTextEncoder, SigLIPVisionEncoder
+from omnimem.config import (
+    PROJECT_ROOT,
+    default_memgallery_dir,
+    default_minilm_model,
+    default_siglip_model,
+    require_memgallery_dir,
+)
+
+from .clients import (
+    ChatAnswerJudge,
+    ChatAnswerModel,
+    ChatRawInspector,
+    OpenAICompatibleClient,
+)
+from .interactive import (
+    ChatGoldEvidenceVerifier,
+    ChatInteractivePlanner,
+    InteractiveActionValidator,
+    InteractiveTeacherSearch,
+    StrictAnswerValidator,
+)
+from .memgallery import build_scenario_store, scenario_samples
+from .memgallery_pipeline import (
+    ProgressBar,
+    now_stamp,
+    resolve_scenarios,
+)
+from .online import OnlineDistillationBuffer, OnlineSelfDistiller
+from .retrieval import TurnAwareHybridRetriever
+
+
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "memgallery_opd_online"
+
+
+def make_components(args: argparse.Namespace) -> Dict[str, Any]:
+    validator = InteractiveActionValidator(
+        max_chunk_actions=args.max_chunk_actions,
+        max_top_k=args.max_top_k,
+        allow_inspect_raw=args.raw_inspection,
+    )
+    student_planner = ChatInteractivePlanner(
+        OpenAICompatibleClient(
+            args.student_base_url,
+            args.student_model,
+            args.student_api_key,
+        ),
+        validator=validator,
+        max_tokens=args.planner_max_tokens,
+    )
+    teacher_planner = ChatInteractivePlanner(
+        OpenAICompatibleClient(
+            args.teacher_base_url,
+            args.teacher_model,
+            args.teacher_api_key,
+        ),
+        validator=validator,
+        max_tokens=args.planner_max_tokens,
+    )
+    evidence_verifier = ChatGoldEvidenceVerifier(
+        OpenAICompatibleClient(
+            args.verifier_base_url,
+            args.verifier_model,
+            args.verifier_api_key,
+        ),
+        max_tokens=args.verifier_max_tokens,
+    )
+    answer_client = OpenAICompatibleClient(
+        args.answer_base_url,
+        args.answer_model,
+        args.answer_api_key,
+    )
+    answer_model = ChatAnswerModel(
+        answer_client,
+        max_tokens=args.answer_max_tokens,
+        max_images=args.answer_max_images,
+    )
+    raw_inspector = (
+        ChatRawInspector(answer_client, max_tokens=args.inspect_max_tokens)
+        if args.raw_inspection
+        else None
+    )
+    judge = ChatAnswerJudge(
+        OpenAICompatibleClient(
+            args.judge_base_url,
+            args.judge_model,
+            args.judge_api_key,
+        ),
+        max_tokens=args.judge_max_tokens,
+    )
+    answer_validator = StrictAnswerValidator(
+        answer_model,
+        judge,
+        min_score=args.min_answer_score,
+    )
+    retriever = TurnAwareHybridRetriever(args.hybrid_alpha)
+    teacher_search = InteractiveTeacherSearch(
+        planner=teacher_planner,
+        verifier=evidence_verifier,
+        validator=validator,
+        retriever=retriever,
+        max_rounds=args.teacher_max_rounds,
+        beam_size=args.teacher_beam_size,
+        candidates_per_node=args.teacher_candidates,
+        max_actions=args.max_actions,
+        max_evidence=args.max_evidence,
+        raw_inspector=raw_inspector,
+        max_raw_inspections=args.max_raw_inspections,
+        answer_validator=answer_validator,
+    )
+    return {
+        "validator": validator,
+        "student_planner": student_planner,
+        "teacher_search": teacher_search,
+        "answer_validator": answer_validator,
+        "retriever": retriever,
+        "raw_inspector": raw_inspector,
+    }
+
+
+def _round_metrics(results: List[Any], buffer_size: int) -> Dict[str, Any]:
+    count = len(results)
+    corrections = [
+        correction
+        for result in results
+        for correction in result.corrections
+    ]
+    feedback_events = [
+        diagnostic
+        for result in results
+        for attempt in result.teacher_attempts
+        for diagnostic in attempt.get("failure_diagnostics", [])
+    ]
+    student_failures = [
+        result
+        for result in results
+        if not result.student_answer_validation.correct
+    ]
+    recovered_failures = [
+        result for result in student_failures if result.corrections
+    ]
+    feedback_assisted_recoveries = sum(
+        any(
+            attempt.get("state_index")
+            in {correction.state_index for correction in result.corrections}
+            and attempt.get("failure_diagnostics")
+            for attempt in result.teacher_attempts
+        )
+        for result in recovered_failures
+    )
+    corrections_from_failures = sum(
+        len(result.corrections) for result in student_failures
+    )
+    return {
+        "samples": count,
+        "student_strict_accuracy": (
+            sum(result.student_answer_validation.correct for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "student_answer_score": (
+            sum(result.student_answer_validation.score for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "correction_states": len(corrections),
+        "corrected_sample_rate": (
+            sum(bool(result.corrections) for result in results) / count
+            if count
+            else 0.0
+        ),
+        "avg_corrections_per_sample": (
+            len(corrections) / count if count else 0.0
+        ),
+        "teacher_feedback_events": len(feedback_events),
+        "student_failure_count": len(student_failures),
+        "teacher_recovered_student_failures": len(recovered_failures),
+        "teacher_failure_recovery_rate": (
+            len(recovered_failures) / len(student_failures)
+            if student_failures
+            else 0.0
+        ),
+        "buffer_true_correction_fraction": (
+            corrections_from_failures / len(corrections)
+            if corrections
+            else 0.0
+        ),
+        "teacher_recovered_after_feedback_rate": (
+            feedback_assisted_recoveries / len(student_failures)
+            if student_failures
+            else 0.0
+        ),
+        "buffer_size": buffer_size,
+    }
+
+
+def _run_update_command(
+    template: str,
+    data_path: Path,
+    output_dir: Path,
+    round_index: int,
+) -> None:
+    rendered = template.format(
+        data=str(data_path),
+        output_dir=str(output_dir),
+        round=round_index,
+    )
+    subprocess.run(shlex.split(rendered), check=True)
+
+
+def run_scenario(
+    path: Path,
+    args: argparse.Namespace,
+    components: Dict[str, Any],
+    dense_encoder: Optional[Any],
+    vision_encoder: Optional[Any],
+) -> Path:
+    started = time.time()
+    scenario = path.stem
+    run_dir = (
+        args.output_dir
+        / scenario
+        / f"{now_stamp()}_online_self_distill"
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    store, _records = build_scenario_store(
+        data,
+        data_dir=args.data_dir,
+        dense_encoder=dense_encoder,
+        vision_encoder=vision_encoder,
+        max_sessions=args.max_sessions,
+        max_turns=args.max_turns,
+    )
+    samples = scenario_samples(
+        data,
+        store=store,
+        data_dir=args.data_dir,
+        scenario=scenario,
+        max_questions=args.max_questions,
+        include_oracle_profile=False,
+    )
+    for sample in samples:
+        sample.metadata.pop("teacher_privileged_context", None)
+
+    buffer = OnlineDistillationBuffer(args.max_buffer_examples)
+    distiller = OnlineSelfDistiller(
+        student_planner=components["student_planner"],
+        teacher_search=components["teacher_search"],
+        answer_validator=components["answer_validator"],
+        validator=components["validator"],
+        retriever=components["retriever"],
+        max_student_rounds=args.student_max_rounds,
+        max_student_actions=args.max_actions,
+        buffer=buffer,
+        raw_inspector=components["raw_inspector"],
+        max_raw_inspections=args.max_raw_inspections,
+    )
+    round_summaries = []
+    for round_index in range(args.distill_rounds):
+        progress = ProgressBar(
+            len(samples),
+            f"{scenario} online r{round_index}",
+            not args.no_progress,
+        )
+        results = []
+        for sample_index, sample in enumerate(samples, start=1):
+            result = distiller.collect_sample(
+                sample,
+                round_index=round_index,
+            )
+            results.append(result)
+            progress.update(
+                sample_index,
+                message=(
+                    f"student={int(result.student_answer_validation.correct)} "
+                    f"labels={len(result.corrections)}"
+                ),
+            )
+        progress.close()
+        round_dir = run_dir / f"round_{round_index:02d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        rollout_path = round_dir / "online_rollouts.jsonl"
+        with rollout_path.open("w", encoding="utf-8") as handle:
+            for result in results:
+                handle.write(
+                    json.dumps(result.to_dict(), ensure_ascii=False) + "\n"
+                )
+        buffer_path = run_dir / "online_sft_buffer.jsonl"
+        buffer.write_jsonl(buffer_path)
+        metrics = _round_metrics(results, len(buffer))
+        metrics["round"] = round_index
+        (round_dir / "metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        round_summaries.append(metrics)
+        if args.student_update_command:
+            update_dir = run_dir / f"student_round_{round_index:02d}"
+            update_dir.mkdir(parents=True, exist_ok=True)
+            _run_update_command(
+                args.student_update_command,
+                buffer_path,
+                update_dir,
+                round_index,
+            )
+
+    summary = {
+        "scenario": scenario,
+        "rounds": round_summaries,
+        "final_buffer_size": len(buffer),
+        "elapsed_seconds": time.time() - started,
+        "student_model": args.student_model,
+        "teacher_model": args.teacher_model,
+        "self_distillation": args.student_model == args.teacher_model,
+    }
+    (run_dir / "metrics.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (run_dir / "config.json").write_text(
+        json.dumps(vars(args), ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    print(f"[INFO] Saved online self-distillation run: {run_dir}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return run_dir
+
+
+def run_scenarios(args: argparse.Namespace) -> List[Path]:
+    paths = resolve_scenarios(args)
+    if not paths:
+        raise FileNotFoundError("no Mem-Gallery scenario files matched")
+    dense_encoder = (
+        MiniLMTextEncoder(args.dense_model, device=args.dense_device)
+        if args.dense_mode == "minilm"
+        else None
+    )
+    vision_encoder = (
+        SigLIPVisionEncoder(args.vision_model, device=args.vision_device)
+        if args.vision_mode == "siglip"
+        else None
+    )
+    components = make_components(args)
+    return [
+        run_scenario(
+            path,
+            args,
+            components,
+            dense_encoder,
+            vision_encoder,
+        )
+        for path in paths
+    ]
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Online self-distillation for interactive OPD-MM."
+    )
+    parser.add_argument("--data-dir", type=Path, default=default_memgallery_dir())
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--scenario", default=None)
+    parser.add_argument("--scenarios", default=None)
+    parser.add_argument("--all-scenarios", action="store_true")
+    parser.add_argument("--max-scenarios", type=int, default=None)
+    parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--max-questions", type=int, default=None)
+    parser.add_argument("--distill-rounds", type=int, default=3)
+    parser.add_argument("--student-max-rounds", type=int, default=3)
+    parser.add_argument("--teacher-max-rounds", type=int, default=3)
+    parser.add_argument("--teacher-beam-size", type=int, default=2)
+    parser.add_argument("--teacher-candidates", type=int, default=3)
+    parser.add_argument("--max-chunk-actions", type=int, default=3)
+    parser.add_argument("--max-actions", type=int, default=9)
+    parser.add_argument("--max-top-k", type=int, default=50)
+    parser.add_argument("--max-evidence", type=int, default=40)
+    parser.add_argument("--max-buffer-examples", type=int, default=None)
+    parser.add_argument("--hybrid-alpha", type=float, default=0.5)
+    parser.add_argument("--dense-mode", choices=["minilm", "off"], default="minilm")
+    parser.add_argument("--dense-model", default=default_minilm_model())
+    parser.add_argument("--dense-device", default="cpu")
+    parser.add_argument("--vision-mode", choices=["siglip", "off"], default="siglip")
+    parser.add_argument("--vision-model", default=default_siglip_model())
+    parser.add_argument("--vision-device", default="cuda:0")
+    parser.add_argument("--student-base-url", default="http://127.0.0.1:11436/v1")
+    parser.add_argument("--student-model", default="gemma3-12b-it-q4km-judge:latest")
+    parser.add_argument("--student-api-key", default="ollama")
+    parser.add_argument("--teacher-base-url", default="http://127.0.0.1:11436/v1")
+    parser.add_argument("--teacher-model", default="gemma3-12b-it-q4km-judge:latest")
+    parser.add_argument("--teacher-api-key", default="ollama")
+    parser.add_argument("--planner-max-tokens", type=int, default=768)
+    parser.add_argument("--verifier-base-url", default="http://127.0.0.1:11436/v1")
+    parser.add_argument("--verifier-model", default="gemma3-12b-it-q4km-judge:latest")
+    parser.add_argument("--verifier-api-key", default="ollama")
+    parser.add_argument("--verifier-max-tokens", type=int, default=192)
+    parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
+    parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
+    parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument("--answer-max-tokens", type=int, default=128)
+    parser.add_argument("--answer-max-images", type=int, default=3)
+    parser.add_argument(
+        "--raw-inspection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--max-raw-inspections", type=int, default=3)
+    parser.add_argument("--inspect-max-tokens", type=int, default=160)
+    parser.add_argument("--judge-base-url", default="http://127.0.0.1:11436/v1")
+    parser.add_argument("--judge-model", default="gemma3-12b-it-q4km-judge:latest")
+    parser.add_argument("--judge-api-key", default="ollama")
+    parser.add_argument("--judge-max-tokens", type=int, default=192)
+    parser.add_argument("--min-answer-score", type=float, default=0.9)
+    parser.add_argument(
+        "--student-update-command",
+        default=None,
+        help=(
+            "Optional command run after each round. Available placeholders: "
+            "{data}, {output_dir}, and {round}. The command must update or "
+            "restart the configured student endpoint before returning."
+        ),
+    )
+    parser.add_argument("--no-progress", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    args.data_dir = require_memgallery_dir(args.data_dir)
+    args.output_dir = args.output_dir.expanduser().resolve()
+    run_scenarios(args)
+
+
+if __name__ == "__main__":
+    main()

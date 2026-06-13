@@ -464,24 +464,61 @@ class ChatRawInspector:
         self.client = client
         self.max_tokens = max_tokens
 
-    def inspect(self, image_path: str, query: str) -> str:
-        prompt = (
-            "Inspect this memory image. Report only visible details relevant to "
-            f"the query, without guessing.\nQuery: {query}"
+    def inspect(
+        self,
+        image_path: str,
+        query: str,
+        question_image: Optional[str] = None,
+        text_context: Optional[str] = None,
+    ) -> str:
+        context = (
+            "\nMemory text context:\n" + text_context[:1200]
+            if text_context
+            else ""
         )
-        return self.client.complete(
-            [
+        if question_image and Path(question_image).is_file():
+            prompt = f"""Compare the question image with this candidate memory image.
+Use visible evidence and the memory text context. Do not guess a fine-grained
+breed or identity from vision alone when the text context provides a label.
+If the user asks what the attached/question image is, decide whether the
+candidate memory text label can transfer to the question image based on visual
+similarity.
+Report:
+- whether the images likely show the same kind of object/entity
+- visible similarities and differences
+- any text-supported label relevant to the query
+
+Query: {query}{context}
+"""
+            content = [
+                {"type": "text", "text": prompt},
+                {"type": "text", "text": "Question image:"},
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_data_url(image_path)},
-                        },
-                    ],
-                }
-            ],
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url(question_image)},
+                },
+                {"type": "text", "text": "Candidate memory image:"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url(image_path)},
+                },
+            ]
+        else:
+            prompt = f"""Inspect this memory image. Report only visible details
+relevant to the query. Use the memory text context when it provides a label, and
+avoid unsupported fine-grained guessing.
+
+Query: {query}{context}
+"""
+            content = [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_data_url(image_path)},
+                },
+            ]
+        return self.client.complete(
+            [{"role": "user", "content": content}],
             max_tokens=self.max_tokens,
             temperature=0.0,
         )
@@ -505,16 +542,30 @@ class ChatAnswerModel:
         question_image: Optional[str] = None,
     ) -> str:
         public_evidence = []
-        image_paths: List[str] = []
+        image_entries: List[tuple[str, str]] = []
         for item in evidence:
             fields = dict(item.fields)
             pointer = fields.pop("raw_pointer", None)
+            image_label = fields.pop("image_label", "")
             public_evidence.append({"source": item.source, **fields})
-            if pointer and Path(str(pointer)).is_file() and pointer not in image_paths:
-                image_paths.append(str(pointer))
+            if (
+                pointer
+                and Path(str(pointer)).is_file()
+                and str(pointer) not in {path for path, _label in image_entries}
+            ):
+                label = image_label or (
+                    f"Memory image from source={item.source}, "
+                    f"turn={fields.get('turn_id', '')}, "
+                    f"modality={fields.get('modality', '')}"
+                )
+                image_entries.append((str(pointer), label))
         prompt = f"""Answer the user query using only the retrieved memory evidence.
 If the evidence is insufficient, answer "Not mentioned." Be concise. Do not
 mention internal memory IDs or file paths.
+When a question image is present, compare it with the labeled memory images.
+Prefer explicit memory text labels over unsupported fine-grained visual breed or
+identity guesses. If visual evidence and memory text conflict, explain using the
+best supported memory evidence.
 
 User query:
 {query}
@@ -526,19 +577,31 @@ Retrieved evidence:
         if question_image and Path(question_image).is_file():
             content.extend(
                 [
-                    {"type": "text", "text": "Attached image from the question:"},
+                    {
+                        "type": "text",
+                        "text": "Question image to compare against memory evidence:",
+                    },
                     {
                         "type": "image_url",
                         "image_url": {"url": image_data_url(question_image)},
                     },
                 ]
             )
-        for pointer in image_paths[: self.max_images]:
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image_data_url(pointer)},
-                }
+        for index, (pointer, label) in enumerate(
+            image_entries[: self.max_images],
+            start=1,
+        ):
+            content.extend(
+                [
+                    {
+                        "type": "text",
+                        "text": f"Memory image {index}: {label}",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_data_url(pointer)},
+                    },
+                ]
             )
         messages: List[Dict[str, Any]]
         if len(content) == 1:
@@ -566,6 +629,8 @@ class ChatAnswerJudge:
         prompt = f"""Judge whether the prediction correctly answers the question
 relative to the gold answer. Semantic equivalence is sufficient. Respect
 yes/no polarity and require all core entities for list answers.
+For an incorrect prediction, explain the missing or contradicted requirement
+without revealing, quoting, or paraphrasing the gold answer itself.
 
 Return only JSON:
 {{"correct": true, "score": 1.0, "reason": "short reason"}}

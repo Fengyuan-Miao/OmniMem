@@ -32,6 +32,7 @@ from .interactive import (
     InteractivePolicyRunner,
     InteractiveSearchResult,
     InteractiveTeacherSearch,
+    StrictAnswerValidator,
     VerificationResult,
 )
 from .memgallery import (
@@ -193,7 +194,11 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         max_tokens=args.verifier_max_tokens,
     )
-    if args.teacher_recall_only:
+    needs_answer_services = (
+        not args.teacher_recall_only
+        or args.teacher_validation == "answer"
+    )
+    if not needs_answer_services:
         answer_model = EmptyAnswerModel()
         judge = AlwaysIncorrectJudge()
         raw_inspector = None
@@ -225,6 +230,15 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             if args.judge_mode == "llm"
             else HeuristicAnswerJudge()
         )
+    answer_validator = (
+        StrictAnswerValidator(
+            answer_model,
+            judge,
+            min_score=args.teacher_min_answer_score,
+        )
+        if args.teacher_validation == "answer"
+        else None
+    )
     retriever = TurnAwareHybridRetriever(args.hybrid_alpha)
     return {
         "validator": validator,
@@ -244,6 +258,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             max_actions=args.max_actions,
             max_evidence=args.max_evidence,
             max_raw_inspections=args.max_raw_inspections,
+            answer_validator=answer_validator,
         ),
         "policy_runner": InteractivePolicyRunner(
             planner=planner,
@@ -254,6 +269,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             max_actions=args.max_actions,
             max_raw_inspections=args.max_raw_inspections,
         ),
+        "answer_validator": answer_validator,
     }
 
 
@@ -288,10 +304,17 @@ def summarize(
         for row in rows
         for decision in row.get("teacher_decisions") or []
     )
+    has_strict_validation = any(
+        row.get("strict_answer_validation") is not None for row in rows
+    )
     primary_metric = (
-        "verifier_answerable_rate"
-        if teacher_recall_only
-        else "answer_accuracy"
+        "strict_answer_validation_rate"
+        if has_strict_validation
+        else (
+            "verifier_answerable_rate"
+            if teacher_recall_only
+            else "answer_accuracy"
+        )
     )
     return {
         "num_results": len(rows),
@@ -333,6 +356,21 @@ def summarize(
         ),
         "avg_verifier_calls": _average(
             [float(row["verifier_calls"]) for row in rows]
+        ),
+        "avg_answer_validator_calls": _average(
+            [float(row["answer_validator_calls"]) for row in rows]
+        ),
+        "strict_answer_validation_rate": _average(
+            [
+                float(
+                    bool(
+                        (row.get("strict_answer_validation") or {}).get(
+                            "correct"
+                        )
+                    )
+                )
+                for row in rows
+            ]
         ),
         "avg_candidates_evaluated": _average(
             [float(row["candidates_evaluated"]) for row in rows]
@@ -458,6 +496,7 @@ def run_scenario(
                 actions = [action.to_dict() for action in search.actions]
                 planner_calls = search.planner_calls
                 verifier_calls = search.verifier_calls
+                answer_validator_calls = search.answer_validator_calls
                 candidates_evaluated = search.candidates_evaluated
                 decisions = _decision_rows(search)
             else:
@@ -478,6 +517,7 @@ def run_scenario(
                 verifier_calls = (
                     components["verifier"].calls - verifier_calls_before
                 )
+                answer_validator_calls = 0
                 candidates_evaluated = 0
                 decisions = [
                     {"planner_raw_response": raw}
@@ -489,17 +529,30 @@ def run_scenario(
                 list(sample.metadata.get("gold_clue_turn_ids") or []),
                 list(sample.metadata.get("gold_image_ids") or []),
             )
-            prediction = components["answer_model"].answer(
-                sample.query,
-                execution.evidence,
-                question_image=question_image,
+            strict_validation = (
+                search.answer_validation
+                if args.mode == "collect-sft"
+                and args.teacher_validation == "answer"
+                else None
             )
-            correct, score, reason, judge_error = _safe_judge(
-                components["judge"],
-                sample.query,
-                prediction,
-                sample.gold_answer,
-            )
+            if strict_validation is not None:
+                prediction = strict_validation.prediction
+                correct = strict_validation.correct
+                score = strict_validation.score
+                reason = strict_validation.reason
+                judge_error = strict_validation.error
+            else:
+                prediction = components["answer_model"].answer(
+                    sample.query,
+                    execution.evidence,
+                    question_image=question_image,
+                )
+                correct, score, reason, judge_error = _safe_judge(
+                    components["judge"],
+                    sample.query,
+                    prediction,
+                    sample.gold_answer,
+                )
             sft_selected = (
                 args.mode == "collect-sft"
                 and _select_sft_trajectory(
@@ -534,6 +587,12 @@ def run_scenario(
                 "judge_error": judge_error,
                 "planner_calls": planner_calls,
                 "verifier_calls": verifier_calls,
+                "answer_validator_calls": answer_validator_calls,
+                "strict_answer_validation": (
+                    strict_validation.to_dict()
+                    if strict_validation is not None
+                    else None
+                ),
                 "candidates_evaluated": candidates_evaluated,
                 "chunk_count": len(decisions),
                 "sft_selected": sft_selected,
@@ -644,10 +703,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "support-grounded",
             "answer-correct",
         ],
-        default="support-grounded",
+        default="answer-correct",
         help=(
-            "answer-correct additionally requires answer generation and judging, "
-            "so it should not be combined with --teacher-recall-only."
+            "answer-correct requires the actual answer VLM and judge to accept "
+            "the teacher trajectory."
         ),
     )
     parser.add_argument("--max-rounds", type=int, default=3)
@@ -676,6 +735,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--verifier-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--verifier-api-key", default="ollama")
     parser.add_argument("--verifier-max-tokens", type=int, default=192)
+    parser.add_argument(
+        "--teacher-validation",
+        choices=["answer", "evidence"],
+        default="answer",
+        help=(
+            "answer validates candidate trajectories through the actual answer "
+            "VLM and judge before allowing STOP."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-min-answer-score",
+        type=float,
+        default=0.9,
+    )
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
@@ -695,14 +768,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    if (
-        args.teacher_recall_only
-        and args.sft_quality_filter == "answer-correct"
-    ):
-        raise ValueError(
-            "--sft-quality-filter answer-correct requires answer generation; "
-            "remove --teacher-recall-only"
-        )
     args.data_dir = require_memgallery_dir(args.data_dir)
     args.output_dir = args.output_dir.expanduser().resolve()
     run_scenarios(args)

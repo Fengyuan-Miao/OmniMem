@@ -17,7 +17,13 @@ from .schema import TrajectoryValidator
 
 
 class RawInspector(Protocol):
-    def inspect(self, image_path: str, query: str) -> str:
+    def inspect(
+        self,
+        image_path: str,
+        query: str,
+        question_image: Optional[str] = None,
+        text_context: Optional[str] = None,
+    ) -> str:
         ...
 
 
@@ -73,7 +79,12 @@ class ToolExecutor:
                     evidence.extend(self._read(pool, action.arguments["fields"]))
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(0, self.max_raw_inspections - raw_calls)
-                    inspected = self._inspect_raw(pool, query, remaining)
+                    inspected = self._inspect_raw(
+                        pool,
+                        query,
+                        remaining,
+                        question_image=question_image,
+                    )
                     raw_calls += len(inspected)
                     evidence.extend(inspected)
                 elif action.tool == "STOP":
@@ -190,22 +201,35 @@ class ToolExecutor:
         pool: List[PoolItem],
         query: str,
         limit: int,
+        question_image: Optional[str] = None,
     ) -> List[EvidenceItem]:
         if self.raw_inspector is None:
             return []
         evidence = []
+        text_by_turn = self._text_context_by_turn(pool)
         for item in pool:
             if len(evidence) >= limit:
                 break
             pointer = item.memory.raw_pointer
             if not pointer:
                 continue
-            observation = self.raw_inspector.inspect(pointer, query)
+            context = text_by_turn.get(item.memory.turn_id, "")
+            observation = self.raw_inspector.inspect(
+                pointer,
+                query,
+                question_image=question_image,
+                text_context=context,
+            )
             evidence.append(
                 EvidenceItem(
                     memory_id=item.memory.memory_id,
                     fields={
                         "visual_observation": observation,
+                        "linked_text_context": context,
+                        "image_label": (
+                            f"turn={item.memory.turn_id}; "
+                            f"context={context[:220]}"
+                        ),
                         "timestamp": item.memory.timestamp,
                         "turn_id": item.memory.turn_id,
                         "raw_pointer": pointer,
@@ -214,3 +238,23 @@ class ToolExecutor:
                 )
             )
         return evidence
+
+    @staticmethod
+    def _text_context_by_turn(pool: List[PoolItem]) -> dict[str, str]:
+        contexts: dict[str, List[str]] = {}
+        for item in pool:
+            memory = item.memory
+            if memory.raw_pointer:
+                continue
+            text = " ".join(
+                value
+                for value in [memory.summary, memory.content, memory.ocr]
+                if value
+            ).strip()
+            if not text:
+                continue
+            contexts.setdefault(memory.turn_id, []).append(text)
+        return {
+            turn_id: " ".join(values)[:1200]
+            for turn_id, values in contexts.items()
+        }

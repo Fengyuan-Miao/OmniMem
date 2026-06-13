@@ -40,6 +40,7 @@ POOL_MUTATING_TOOLS = {
 }
 INTERACTIVE_TOOLS = POOL_MUTATING_TOOLS | {"READ", "INSPECT_RAW", "STOP"}
 RETRIEVE_SCOPES = {"all", "current"}
+PUBLIC_IMAGE_ID_PATTERN = re.compile(r"\bD\d+:IMG_\d+\b")
 DEFAULT_READ_FIELDS = [
     "summary",
     "content",
@@ -51,6 +52,28 @@ DEFAULT_READ_FIELDS = [
     "source_type",
     "raw_pointer",
 ]
+
+
+def _evidence_mentions_visual_content(item: EvidenceItem) -> bool:
+    if item.source == "INSPECT_RAW":
+        return True
+    fields = item.fields
+    if fields.get("raw_pointer") or fields.get("visual_observation"):
+        return True
+    modality_values = fields.get("modality", [])
+    source_values = fields.get("source_type", [])
+    values = (
+        modality_values
+        if isinstance(modality_values, list)
+        else [modality_values]
+    ) + (
+        source_values if isinstance(source_values, list) else [source_values]
+    )
+    return any(
+        token in str(value).lower()
+        for value in values
+        for token in ("image", "visual", "photo", "uploaded")
+    )
 
 
 def build_interactive_schema(allow_inspect_raw: bool = False) -> str:
@@ -529,6 +552,7 @@ class ExecutorSession:
                         self.pool,
                         self.query,
                         remaining,
+                        question_image=self.question_image,
                     )
                     self.raw_inspection_calls += len(inspected)
                     self._append_evidence(inspected)
@@ -686,6 +710,7 @@ class VerificationResult:
     redundancy: float
     reason: str = ""
     error: str = ""
+    diagnostic: Dict[str, Any] = field(default_factory=dict)
 
     def planner_feedback(self) -> Dict[str, Any]:
         def band(value: float) -> str:
@@ -695,7 +720,7 @@ class VerificationResult:
                 return "medium"
             return "low"
 
-        return {
+        feedback = {
             "answerable": self.answerable,
             "relevance": band(self.relevance),
             "completeness": (
@@ -704,6 +729,9 @@ class VerificationResult:
             "redundancy": band(self.redundancy),
             "continue_required": not self.answerable,
         }
+        if self.diagnostic:
+            feedback["failure_diagnostic"] = self.diagnostic
+        return feedback
 
     def to_dict(self, include_reason: bool = True) -> Dict[str, Any]:
         data = {
@@ -712,6 +740,7 @@ class VerificationResult:
             "completeness": self.completeness,
             "redundancy": self.redundancy,
             "error": self.error,
+            "diagnostic": self.diagnostic,
         }
         if include_reason:
             data["reason"] = self.reason
@@ -726,6 +755,204 @@ class EvidenceVerifier(Protocol):
         evidence: List[EvidenceItem],
     ) -> VerificationResult:
         ...
+
+
+@dataclass
+class AnswerValidationResult:
+    correct: bool
+    score: float
+    prediction: str
+    reason: str = ""
+    error: str = ""
+    image_ids_match: Optional[bool] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "correct": self.correct,
+            "score": self.score,
+            "prediction": self.prediction,
+            "reason": self.reason,
+            "error": self.error,
+            "image_ids_match": self.image_ids_match,
+        }
+
+    def failure_feedback(
+        self,
+        evidence: List[EvidenceItem],
+        can_inspect_raw: bool = False,
+    ) -> Dict[str, Any]:
+        """Return training-only diagnostics without exposing the gold answer."""
+        if self.correct:
+            return {}
+
+        has_raw_inspection = any(
+            item.source == "INSPECT_RAW" for item in evidence
+        )
+        has_visual_evidence = any(
+            _evidence_mentions_visual_content(item) for item in evidence
+        )
+
+        if not evidence:
+            failure_type = "no_evidence"
+            evidence_gap = "No evidence has been read for the answer model."
+            recommended_change = (
+                "Retrieve a focused candidate pool, then READ relevant fields."
+            )
+        elif self.error:
+            failure_type = "answer_validation_error"
+            evidence_gap = "The answer validation call failed."
+            recommended_change = (
+                "Continue with a different evidence path and validate again."
+            )
+        elif self.image_ids_match is False:
+            failure_type = "image_id_mismatch"
+            evidence_gap = (
+                "The predicted public image IDs do not match the required set."
+            )
+            recommended_change = (
+                "Refine retrieval to isolate the relevant visual memories and "
+                "inspect the raw candidates before answering."
+                if can_inspect_raw
+                else "Refine retrieval to isolate the relevant visual memories."
+            )
+        elif has_visual_evidence and not has_raw_inspection:
+            failure_type = "uninspected_visual_evidence"
+            evidence_gap = (
+                "Visual memories are present, but the answer model could not "
+                "derive a correct answer from the currently read representation."
+            )
+            recommended_change = (
+                "Use INSPECT_RAW on the strongest visual candidates, then "
+                "validate the answer again."
+                if can_inspect_raw
+                else "Reformulate retrieval to surface more discriminative "
+                "visual captions or surrounding context."
+            )
+        elif has_raw_inspection:
+            failure_type = "answer_mismatch_after_raw_inspection"
+            evidence_gap = (
+                "The inspected visual evidence still does not support a correct "
+                "answer."
+            )
+            recommended_change = (
+                "Change the retrieval query or candidate pool instead of "
+                "re-inspecting the same evidence."
+            )
+        else:
+            failure_type = "answer_mismatch"
+            evidence_gap = (
+                "The answer model could not derive the required answer from the "
+                "current evidence."
+            )
+            recommended_change = (
+                "Reformulate retrieval, change retrieval method, or expand "
+                "neighboring turns before reading again."
+            )
+
+        diagnostic = {
+            "failure_type": failure_type,
+            "predicted_answer": _clip(self.prediction, 300),
+            "judge_reason": _clip(self.reason or self.error, 500),
+            "answer_score": round(float(self.score), 4),
+            "image_ids_match": self.image_ids_match,
+            "evidence_gap": evidence_gap,
+            "recommended_change": recommended_change,
+        }
+        return {
+            key: value
+            for key, value in diagnostic.items()
+            if value not in {"", None}
+        }
+
+
+class AnswerGenerator(Protocol):
+    def answer(
+        self,
+        query: str,
+        evidence: List[EvidenceItem],
+        question_image: Optional[str] = None,
+    ) -> str:
+        ...
+
+
+class AnswerJudge(Protocol):
+    def evaluate(
+        self,
+        query: str,
+        prediction: str,
+        gold_answer: str,
+    ) -> tuple[bool, float, str]:
+        ...
+
+
+class StrictAnswerValidator:
+    """Validate a trajectory through the actual answer model and judge."""
+
+    def __init__(
+        self,
+        answer_model: AnswerGenerator,
+        judge: AnswerJudge,
+        min_score: float = 0.9,
+    ):
+        self.answer_model = answer_model
+        self.judge = judge
+        self.min_score = max(0.0, min(1.0, float(min_score)))
+        self.calls = 0
+
+    def evaluate(
+        self,
+        query: str,
+        gold_answer: str,
+        evidence: List[EvidenceItem],
+        question_image: Optional[str] = None,
+    ) -> AnswerValidationResult:
+        self.calls += 1
+        if not evidence:
+            return AnswerValidationResult(
+                correct=False,
+                score=0.0,
+                prediction="",
+                reason="No retrieved evidence was provided.",
+            )
+        try:
+            prediction = self.answer_model.answer(
+                query,
+                evidence,
+                question_image=question_image,
+            )
+            judge_correct, score, reason = self.judge.evaluate(
+                query,
+                prediction,
+                gold_answer,
+            )
+            score = max(0.0, min(1.0, float(score)))
+            gold_ids = set(PUBLIC_IMAGE_ID_PATTERN.findall(gold_answer))
+            predicted_ids = set(
+                PUBLIC_IMAGE_ID_PATTERN.findall(prediction)
+            )
+            image_ids_match = (
+                predicted_ids == gold_ids if gold_ids else None
+            )
+            correct = (
+                bool(judge_correct)
+                and score >= self.min_score
+                and image_ids_match is not False
+            )
+            return AnswerValidationResult(
+                correct=correct,
+                score=score,
+                prediction=prediction,
+                reason=str(reason or ""),
+                image_ids_match=image_ids_match,
+            )
+        except Exception as exc:
+            return AnswerValidationResult(
+                correct=False,
+                score=0.0,
+                prediction="",
+                error=str(exc),
+                reason="Answer validation failed.",
+            )
 
 
 class ChatGoldEvidenceVerifier:
@@ -978,6 +1205,8 @@ Propose {max(1, candidate_count)} materially different candidate chunks.
 Prefer changing retrieval query, method, scope, neighbor expansion, or action
 ordering before merely increasing top_k. STOP only when observed evidence is
 sufficient and at least one READ or INSPECT_RAW has produced evidence.
+When training-only failure_diagnostic is present, directly address its
+evidence_gap and recommended_change. Do not repeat the failed action pattern.
 RETRIEVE changes the candidate pool but does not add answer evidence. After a
 useful candidate pool is visible, use READ with exactly the allowed fields.
 Do not add arguments such as limit, reason, filter, pool_record_id, or IDs.
@@ -1127,16 +1356,46 @@ class SearchNode:
     verification: VerificationResult = field(
         default_factory=lambda: VerificationResult(False, 0.0, 0.0, 0.0)
     )
+    answer_validation: Optional[AnswerValidationResult] = None
 
     def score(self) -> tuple[Any, ...]:
+        raw_evidence = sum(
+            1 for item in self.session.evidence if item.source == "INSPECT_RAW"
+        )
+        no_op_reads = self._redundant_read_count()
         return (
+            int(
+                self.answer_validation is not None
+                and self.answer_validation.correct
+            ),
             int(self.verification.answerable),
             self.verification.completeness,
             self.verification.relevance,
             -self.verification.redundancy,
-            -len(self.session.evidence),
+            min(raw_evidence, 3),
+            -no_op_reads,
             -len(self.session.history),
         )
+
+    def _redundant_read_count(self) -> int:
+        reads = []
+        pool_fingerprint = ""
+        count = 0
+        for step in self.session.steps:
+            action = step.action
+            if action.tool in POOL_MUTATING_TOOLS:
+                pool_fingerprint = f"{step.index}:{step.pool_after}"
+            if action.tool != "READ":
+                continue
+            signature = (
+                pool_fingerprint,
+                tuple(action.arguments.get("fields", [])),
+                step.evidence_added,
+            )
+            if signature in reads:
+                count += 1
+            reads.append(signature)
+        return count
 
 
 @dataclass
@@ -1148,6 +1407,9 @@ class InteractiveSearchResult:
     candidates_evaluated: int
     planner_calls: int
     verifier_calls: int
+    answer_validation: Optional[AnswerValidationResult] = None
+    answer_validator_calls: int = 0
+    failure_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
     def sft_examples(
         self,
@@ -1261,6 +1523,7 @@ class InteractiveTeacherSearch:
         max_actions: int = 9,
         max_evidence: int = 40,
         max_raw_inspections: int = 3,
+        answer_validator: Optional[StrictAnswerValidator] = None,
     ):
         self.planner = planner
         self.verifier = verifier
@@ -1273,6 +1536,7 @@ class InteractiveTeacherSearch:
         self.max_actions = max(1, int(max_actions))
         self.max_evidence = max(1, int(max_evidence))
         self.max_raw_inspections = max(0, int(max_raw_inspections))
+        self.answer_validator = answer_validator
 
     def search(
         self,
@@ -1280,21 +1544,36 @@ class InteractiveTeacherSearch:
         gold_answer: str,
         memory_store: HiddenMemoryStore,
         question_image: Optional[str] = None,
+        initial_session: Optional[ExecutorSession] = None,
     ) -> InteractiveSearchResult:
-        initial = ExecutorSession(
-            query=query,
-            memory_store=memory_store,
-            validator=self.validator,
-            retriever=self.retriever,
-            raw_inspector=self.raw_inspector,
-            question_image=question_image,
-            max_raw_inspections=self.max_raw_inspections,
+        initial = (
+            initial_session.clone()
+            if initial_session is not None
+            else ExecutorSession(
+                query=query,
+                memory_store=memory_store,
+                validator=self.validator,
+                retriever=self.retriever,
+                raw_inspector=self.raw_inspector,
+                question_image=question_image,
+                max_raw_inspections=self.max_raw_inspections,
+            )
         )
+        if initial.query != query or initial.memory_store is not memory_store:
+            raise ValueError(
+                "initial_session must belong to the current query and store"
+            )
         beam = [SearchNode(session=initial)]
         finished: List[SearchNode] = []
         candidates_evaluated = 0
+        failure_diagnostics: List[Dict[str, Any]] = []
         planner_calls_before = getattr(self.planner, "calls", 0)
         verifier_calls_before = getattr(self.verifier, "calls", 0)
+        answer_validator_calls_before = getattr(
+            self.answer_validator,
+            "calls",
+            0,
+        )
 
         for _round_index in range(self.max_rounds):
             children: List[SearchNode] = []
@@ -1349,6 +1628,67 @@ class InteractiveTeacherSearch:
                         gold_answer,
                         child_session.evidence,
                     )
+                    answer_validation = None
+                    if (
+                        verification.answerable
+                        and self.answer_validator is not None
+                    ):
+                        answer_validation = self.answer_validator.evaluate(
+                            query,
+                            gold_answer,
+                            child_session.evidence,
+                            question_image=question_image,
+                        )
+                        if not answer_validation.correct:
+                            diagnostic = answer_validation.failure_feedback(
+                                child_session.evidence,
+                                can_inspect_raw=(
+                                    self.validator.allow_inspect_raw
+                                    and self.raw_inspector is not None
+                                ),
+                            )
+                            verification = VerificationResult(
+                                answerable=False,
+                                relevance=verification.relevance,
+                                completeness=min(
+                                    verification.completeness,
+                                    0.49,
+                                ),
+                                redundancy=verification.redundancy,
+                                reason=(
+                                    "Strict answer validation failed: "
+                                    + (
+                                        answer_validation.reason
+                                        or answer_validation.error
+                                    )
+                                ),
+                                error=answer_validation.error,
+                                diagnostic=diagnostic,
+                            )
+                            failure_diagnostics.append(
+                                {
+                                    "round_index": _round_index,
+                                    "history": [
+                                        action.to_dict()
+                                        for action in node.session.history
+                                    ],
+                                    "candidate_actions": [
+                                        action.to_dict() for action in chunk
+                                    ],
+                                    "answer_validation": (
+                                        answer_validation.to_dict()
+                                    ),
+                                    "teacher_feedback": (
+                                        verification.planner_feedback()
+                                    ),
+                                    "evidence_count": len(
+                                        child_session.evidence
+                                    ),
+                                    "raw_inspection_calls": (
+                                        child_session.raw_inspection_calls
+                                    ),
+                                }
+                            )
                     candidates_evaluated += 1
                     decision = InteractiveDecision(
                         observation=observation,
@@ -1374,6 +1714,7 @@ class InteractiveTeacherSearch:
                         session=child_session,
                         decisions=[*node.decisions, decision],
                         verification=verification,
+                        answer_validation=answer_validation,
                     )
                     if child_session.stopped:
                         finished.append(child)
@@ -1402,6 +1743,7 @@ class InteractiveTeacherSearch:
                                     ),
                                 ],
                                 verification=verification,
+                                answer_validation=answer_validation,
                             )
                         )
                     elif len(child_session.evidence) <= self.max_evidence:
@@ -1455,4 +1797,10 @@ class InteractiveTeacherSearch:
             - planner_calls_before,
             verifier_calls=getattr(self.verifier, "calls", 0)
             - verifier_calls_before,
+            answer_validation=selected.answer_validation,
+            answer_validator_calls=(
+                getattr(self.answer_validator, "calls", 0)
+                - answer_validator_calls_before
+            ),
+            failure_diagnostics=failure_diagnostics,
         )

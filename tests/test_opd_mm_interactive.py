@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from opd_mm_baseline.interactive import (
@@ -10,12 +12,23 @@ from opd_mm_baseline.interactive import (
     InteractivePolicyRunner,
     InteractiveTeacherSearch,
     InteractiveValidationError,
+    StrictAnswerValidator,
     VerificationResult,
 )
 from opd_mm_baseline.memgallery_interactive_pipeline import (
     _select_sft_trajectory,
 )
-from opd_mm_baseline.models import EvidenceItem, MemoryRecord, ToolAction
+from opd_mm_baseline.models import (
+    EvidenceItem,
+    MemoryRecord,
+    OPDSample,
+    SFTExample,
+    ToolAction,
+)
+from opd_mm_baseline.online import (
+    OnlineDistillationBuffer,
+    OnlineSelfDistiller,
+)
 from opd_mm_baseline.retrieval import HiddenMemoryStore, TurnAwareHybridRetriever
 
 
@@ -354,6 +367,124 @@ def test_gold_verifier_applies_grounding_thresholds() -> None:
     assert not result.answerable
 
 
+class EvidenceEchoAnswer:
+    def answer(self, query, evidence, question_image=None):
+        return " ".join(
+            str(value)
+            for item in evidence
+            for value in item.fields.values()
+        )
+
+
+class ContainsBananaJudge:
+    def evaluate(self, query, prediction, gold_answer):
+        correct = "banana" in prediction.lower()
+        return correct, float(correct), "contains banana"
+
+
+def test_strict_answer_validator_requires_exact_gold_image_ids() -> None:
+    validator = StrictAnswerValidator(
+        EvidenceEchoAnswer(),
+        ContainsBananaJudge(),
+        min_score=0.9,
+    )
+    result = validator.evaluate(
+        "Which images?",
+        "D1:IMG_001, D1:IMG_002",
+        [
+            EvidenceItem(
+                "D1:1",
+                {"content": "banana D1:IMG_001 D1:IMG_003"},
+            )
+        ],
+    )
+    assert not result.correct
+    assert result.image_ids_match is False
+
+
+class AlwaysSufficientVerifier:
+    def __init__(self):
+        self.calls = 0
+
+    def evaluate(self, query, gold_answer, evidence):
+        self.calls += 1
+        return VerificationResult(
+            answerable=bool(evidence),
+            relevance=1.0,
+            completeness=1.0,
+            redundancy=0.0,
+        )
+
+
+class CorrectingPlanner:
+    def __init__(self):
+        self.calls = 0
+        self.last_raw_response = ""
+        self.last_candidate_sources = {}
+        self.feedback = []
+
+    def propose(
+        self,
+        query,
+        history,
+        observation,
+        candidate_count=1,
+        privileged_feedback=None,
+    ):
+        self.calls += 1
+        self.feedback.append(privileged_feedback)
+        term = "apples" if not history else "banana"
+        actions = [
+            ToolAction(
+                "RETRIEVE",
+                {"method": "bm25", "top_k": 1, "query": term},
+            ),
+            ToolAction("READ", {"fields": ["content"]}),
+        ]
+        signature = json.dumps(
+            [action.to_dict() for action in actions],
+            sort_keys=True,
+        )
+        self.last_candidate_sources = {signature: "planner"}
+        return [actions]
+
+
+def test_teacher_search_continues_when_strict_answer_validation_fails() -> None:
+    answer_validator = StrictAnswerValidator(
+        EvidenceEchoAnswer(),
+        ContainsBananaJudge(),
+    )
+    planner = CorrectingPlanner()
+    result = InteractiveTeacherSearch(
+        planner=planner,
+        verifier=AlwaysSufficientVerifier(),
+        validator=InteractiveActionValidator(),
+        retriever=TurnAwareHybridRetriever(context_window=0),
+        answer_validator=answer_validator,
+        max_rounds=2,
+        beam_size=1,
+        candidates_per_node=1,
+    ).search(
+        query="Which project did Bob select?",
+        gold_answer="banana",
+        memory_store=make_store(),
+    )
+    assert result.answer_validation is not None
+    assert result.answer_validation.correct
+    assert result.answer_validator_calls == 2
+    assert result.failure_diagnostics
+    assert planner.feedback[0] is None
+    failure = planner.feedback[1]["failure_diagnostic"]
+    assert failure["failure_type"] == "answer_mismatch"
+    assert "Alice discussed apples." in failure["predicted_answer"]
+    assert "recommended_change" in failure
+    assert any(
+        action.arguments.get("query") == "banana"
+        for action in result.actions
+        if action.tool == "RETRIEVE"
+    )
+
+
 def test_support_grounded_sft_filter_uses_available_annotations() -> None:
     verification = VerificationResult(True, 1.0, 1.0, 0.0)
     assert _select_sft_trajectory(
@@ -435,3 +566,92 @@ def test_teacher_search_uses_online_fallback_instead_of_empty_stop() -> None:
     assert result.verification.answerable
     assert any(action.tool == "READ" for action in result.actions)
     assert result.decisions[0].action_source == "controller_fallback"
+
+
+def test_online_distillation_buffer_deduplicates_examples(tmp_path) -> None:
+    buffer = OnlineDistillationBuffer()
+    example = SFTExample("one", "input", "target")
+    assert buffer.add(example, round_index=0)
+    assert not buffer.add(example, round_index=1)
+    assert len(buffer) == 1
+    output = tmp_path / "buffer.jsonl"
+    buffer.write_jsonl(output)
+    row = json.loads(output.read_text().strip())
+    assert row["buffer"]["seen_count"] == 2
+    assert row["buffer"]["last_round"] == 1
+
+
+class OnlineStudentPlanner:
+    def __init__(self):
+        self.calls = 0
+
+    def propose(
+        self,
+        query,
+        history,
+        observation,
+        candidate_count=1,
+        privileged_feedback=None,
+    ):
+        self.calls += 1
+        if history:
+            return [[ToolAction("STOP")]]
+        return [
+            [
+                ToolAction(
+                    "RETRIEVE",
+                    {"method": "bm25", "top_k": 1, "query": "apples"},
+                ),
+                ToolAction("READ", {"fields": ["content"]}),
+            ]
+        ]
+
+
+def test_online_self_distiller_labels_student_visited_states() -> None:
+    validator = InteractiveActionValidator()
+    answer_validator = StrictAnswerValidator(
+        EvidenceEchoAnswer(),
+        ContainsBananaJudge(),
+    )
+    teacher_search = InteractiveTeacherSearch(
+        planner=CorrectingPlanner(),
+        verifier=AlwaysSufficientVerifier(),
+        validator=validator,
+        retriever=TurnAwareHybridRetriever(context_window=0),
+        answer_validator=answer_validator,
+        max_rounds=2,
+        beam_size=1,
+        candidates_per_node=1,
+    )
+    buffer = OnlineDistillationBuffer()
+    distiller = OnlineSelfDistiller(
+        student_planner=OnlineStudentPlanner(),
+        teacher_search=teacher_search,
+        answer_validator=answer_validator,
+        validator=validator,
+        retriever=TurnAwareHybridRetriever(context_window=0),
+        max_student_rounds=2,
+        buffer=buffer,
+    )
+    result = distiller.collect_sample(
+        OPDSample(
+            sample_id="sample",
+            query="Which project did Bob select?",
+            gold_answer="banana",
+            memory_store=make_store(),
+        ),
+        round_index=3,
+    )
+    assert len(result.corrections) == 2
+    assert len(result.teacher_attempts) == 2
+    assert result.teacher_attempts[0]["answer_validation"]["correct"]
+    assert len(distiller.buffer) == 2
+    assert len(buffer) == 2
+    second = result.corrections[1]
+    assert any(
+        action.arguments.get("query") == "banana"
+        for action in second.teacher_actions
+        if action.tool == "RETRIEVE"
+    )
+    assert "Alice discussed apples" in second.example.input
+    assert second.example.round_index == 3

@@ -182,6 +182,21 @@ omnimem benchmark memgallery opd-interactive \
   --mode evaluate
 ```
 
+Collect student-state corrections for online self-distillation:
+
+```bash
+omnimem benchmark memgallery opd-online \
+  --scenario Academic_Animal_Pet_Research_Life \
+  --max-questions 20 \
+  --distill-rounds 3
+```
+
+The student and searched teacher may point to the same model. Teacher labels
+are retained only when their complete continuation lets the actual answer VLM
+pass the strict judge. `online_sft_buffer.jsonl` is deduplicated across rounds.
+Use `--student-update-command` to train and restart the student endpoint after
+each round; placeholders `{data}`, `{output_dir}`, and `{round}` are available.
+
 Equivalent direct entry points are installed:
 
 ```text
@@ -191,6 +206,7 @@ omnimem-memgallery-topic
 omnimem-memgallery-svi
 omnimem-memgallery-opd
 omnimem-memgallery-opd-interactive
+omnimem-memgallery-opd-online
 omnimem-opd-sft
 ```
 

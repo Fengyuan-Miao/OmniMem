@@ -15,6 +15,7 @@ RUNNERS = {
     "svi": "memgallery_svi_pipeline",
     "opd": "opd_mm_baseline.memgallery_pipeline",
     "opd-interactive": "opd_mm_baseline.memgallery_interactive_pipeline",
+    "opd-online": "opd_mm_baseline.memgallery_online_pipeline",
 }
 
 
