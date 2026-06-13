@@ -42,6 +42,26 @@ generation.
 An experimental topic-gated extension of the dual-encoder method. It uses an
 LLM-maintained topic index to narrow retrieval before multimodal search.
 
+### OPD-MM query-only policy
+
+An isolated on-policy distillation baseline under `opd_mm_baseline/`. A student
+model sees only the query and generic tool schema, while a hidden executor
+applies validated `FILTER`, `SORT`, `TOPK`, `RETRIEVE`, `READ`,
+`INSPECT_RAW`, and `STOP` actions. A hindsight teacher produces corrected
+abstract trajectories for standard SFT without seeing the memory index.
+
+The interactive variant trains the same interface used at inference time:
+`query + action history + executor observation -> next action chunk`. Its
+planner never receives the gold answer or annotated support. During data
+collection only, a separate gold-aware verifier scores completed evidence and
+selects efficient planner branches; verifier reasons and labels are excluded
+from SFT inputs. The default `support-grounded` export filter additionally
+requires retrieved evidence to overlap annotated support when the dataset
+provides it. Support identifiers are used only for filtering and are never
+shown to the planner. For maximum precision, `--sft-quality-filter
+answer-correct` additionally keeps only trajectories whose retrieved evidence
+lets the answer model pass the judge.
+
 ### SVI compatibility experiment
 
 The earlier Structured Visual Index implementation remains available for
@@ -136,6 +156,32 @@ Run all scenarios:
 omnimem benchmark memgallery gme --all-scenarios --gme-device cuda:1
 ```
 
+Collect OPD-MM hindsight trajectories:
+
+```bash
+omnimem benchmark memgallery opd \
+  --scenario Academic_Animal_Pet_Research_Life \
+  --max-questions 5 \
+  --mode collect-sft
+```
+
+Collect step-level interactive trajectories:
+
+```bash
+omnimem benchmark memgallery opd-interactive \
+  --scenario Academic_Animal_Pet_Research_Life \
+  --max-questions 5 \
+  --mode collect-sft
+```
+
+Run the same planner online without verifier feedback:
+
+```bash
+omnimem benchmark memgallery opd-interactive \
+  --scenario Academic_Animal_Pet_Research_Life \
+  --mode evaluate
+```
+
 Equivalent direct entry points are installed:
 
 ```text
@@ -143,6 +189,9 @@ omnimem-memgallery-gme
 omnimem-memgallery-dual
 omnimem-memgallery-topic
 omnimem-memgallery-svi
+omnimem-memgallery-opd
+omnimem-memgallery-opd-interactive
+omnimem-opd-sft
 ```
 
 Use `--help` on a runner to see all retrieval, context, answer-model, and judge
@@ -199,6 +248,7 @@ omnimem/                    project configuration and CLI
 gme_memory/                 unified multimodal entry memory
 dual_encoder_memory/        MiniLM, SigLIP, BM25, RRF, evidence organization
 topic_memory/               topic-gated experimental retrieval
+opd_mm_baseline/            query-only tools and on-policy distillation
 svi_omnimem/                legacy SVI compatibility experiment
 memgallery_*_pipeline.py    Mem-Gallery runners
 ollama/                     local Ollama Modelfile examples

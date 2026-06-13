@@ -36,6 +36,11 @@ all = [
 dev = [
     "pytest>=8",
 ]
+sft = [
+    "accelerate>=1.0",
+    "torch>=2.1",
+    "transformers>=4.45",
+]
 
 [project.scripts]
 omnimem = "omnimem.cli:main"
@@ -43,6 +48,9 @@ omnimem-memgallery-gme = "memgallery_gme_pipeline:main"
 omnimem-memgallery-dual = "memgallery_dual_encoder_pipeline:main"
 omnimem-memgallery-topic = "topic_memory.memgallery_topic_pipeline:main"
 omnimem-memgallery-svi = "memgallery_svi_pipeline:main"
+omnimem-memgallery-opd = "opd_mm_baseline.memgallery_pipeline:main"
+omnimem-memgallery-opd-interactive = "opd_mm_baseline.memgallery_interactive_pipeline:main"
+omnimem-opd-sft = "opd_mm_baseline.sft:main"
 
 [tool.setuptools]
 py-modules = [
@@ -59,6 +67,7 @@ include = [
     "gme_memory*",
     "svi_omnimem*",
     "topic_memory*",
+    "opd_mm_baseline*",
 ]
 
 [tool.pytest.ini_options]

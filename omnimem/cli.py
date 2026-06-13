@@ -13,6 +13,8 @@ RUNNERS = {
     "dual": "memgallery_dual_encoder_pipeline",
     "topic": "topic_memory.memgallery_topic_pipeline",
     "svi": "memgallery_svi_pipeline",
+    "opd": "opd_mm_baseline.memgallery_pipeline",
+    "opd-interactive": "opd_mm_baseline.memgallery_interactive_pipeline",
 }
 
 
