@@ -20,6 +20,26 @@ from .models import OPDSample, SFTExample, ToolAction
 from .retrieval import TurnAwareHybridRetriever
 
 
+TRAINABLE_TEACHER_ACTION_SOURCES = {"planner"}
+SYSTEM_STOP_ACTION_SOURCES = {"verifier_stop"}
+
+
+def _is_trainable_teacher_path(decisions: List[Any]) -> bool:
+    """Only distill trajectories whose non-stop actions came from the model."""
+    if not decisions:
+        return False
+    for decision in decisions:
+        if decision.action_source in TRAINABLE_TEACHER_ACTION_SOURCES:
+            continue
+        if (
+            decision.action_source in SYSTEM_STOP_ACTION_SOURCES
+            and all(action.tool == "STOP" for action in decision.actions)
+        ):
+            continue
+        return False
+    return True
+
+
 class InteractivePlanner(Protocol):
     calls: int
 
@@ -238,12 +258,33 @@ class OnlineSelfDistiller:
                 question_image=question_image,
                 initial_session=session,
             )
+            decision_sources = [
+                decision.action_source for decision in teacher_result.decisions
+            ]
+            decision_reflections = [
+                decision.teacher_reflection
+                for decision in teacher_result.decisions
+            ]
+            trainable_path = _is_trainable_teacher_path(
+                teacher_result.decisions
+            )
             teacher_attempts.append(
                 {
                     "state_index": state_index,
                     "selected_actions": [
                         action.to_dict() for action in teacher_result.actions
                     ],
+                    "selected_action_sources": decision_sources,
+                    "selected_reflections": decision_reflections,
+                    "selected_first_action_source": (
+                        decision_sources[0] if decision_sources else None
+                    ),
+                    "selected_first_action_trainable": (
+                        bool(decision_sources)
+                        and decision_sources[0]
+                        in TRAINABLE_TEACHER_ACTION_SOURCES
+                    ),
+                    "selected_path_trainable": trainable_path,
                     "verification": teacher_result.verification.to_dict(),
                     "answer_validation": (
                         teacher_result.answer_validation.to_dict()
@@ -287,6 +328,10 @@ class OnlineSelfDistiller:
                 and teacher_result.decisions
             ):
                 decision = teacher_result.decisions[0]
+                is_trainable_source = (
+                    decision.action_source in TRAINABLE_TEACHER_ACTION_SOURCES
+                    and trainable_path
+                )
                 example = decision.sft_example(
                     sample.sample_id,
                     state_index,
@@ -305,6 +350,8 @@ class OnlineSelfDistiller:
                         ],
                         "teacher_answer_score": teacher_validation.score,
                         "teacher_action_source": decision.action_source,
+                        "trainable_teacher_source": is_trainable_source,
+                        "teacher_reflection": decision.teacher_reflection,
                     }
                 )
                 correction = OnlineCorrection(
@@ -315,8 +362,9 @@ class OnlineSelfDistiller:
                     teacher_answer_validation=teacher_validation,
                     example=example,
                 )
-                corrections.append(correction)
-                self.buffer.add(example, round_index)
+                if is_trainable_source:
+                    corrections.append(correction)
+                    self.buffer.add(example, round_index)
 
             if len(session.history) + len(student_actions) > self.max_student_actions:
                 break

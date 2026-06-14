@@ -23,6 +23,7 @@ from .clients import (
     ChatAnswerJudge,
     ChatAnswerModel,
     ChatRawInspector,
+    HFQwenVLClient,
     OpenAICompatibleClient,
 )
 from .interactive import (
@@ -45,26 +46,53 @@ from .retrieval import TurnAwareHybridRetriever
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "memgallery_opd_online"
 
 
+def _make_chat_client(
+    *,
+    backend: str,
+    base_url: str,
+    model: str,
+    api_key: str,
+    device: str,
+    dtype: str,
+    hf_cache: Dict[tuple[str, str, str], HFQwenVLClient],
+) -> Any:
+    if backend == "hf-qwen-vl":
+        key = (model, device, dtype)
+        if key not in hf_cache:
+            hf_cache[key] = HFQwenVLClient(model, device=device, dtype=dtype)
+        return hf_cache[key]
+    return OpenAICompatibleClient(base_url, model, api_key)
+
+
 def make_components(args: argparse.Namespace) -> Dict[str, Any]:
     validator = InteractiveActionValidator(
         max_chunk_actions=args.max_chunk_actions,
         max_top_k=args.max_top_k,
         allow_inspect_raw=args.raw_inspection,
     )
+    hf_cache: Dict[tuple[str, str, str], HFQwenVLClient] = {}
     student_planner = ChatInteractivePlanner(
-        OpenAICompatibleClient(
-            args.student_base_url,
-            args.student_model,
-            args.student_api_key,
+        _make_chat_client(
+            backend=args.student_backend,
+            base_url=args.student_base_url,
+            model=args.student_model,
+            api_key=args.student_api_key,
+            device=args.student_device,
+            dtype=args.student_dtype,
+            hf_cache=hf_cache,
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
     )
     teacher_planner = ChatInteractivePlanner(
-        OpenAICompatibleClient(
-            args.teacher_base_url,
-            args.teacher_model,
-            args.teacher_api_key,
+        _make_chat_client(
+            backend=args.teacher_backend,
+            base_url=args.teacher_base_url,
+            model=args.teacher_model,
+            api_key=args.teacher_api_key,
+            device=args.teacher_device,
+            dtype=args.teacher_dtype,
+            hf_cache=hf_cache,
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
@@ -77,11 +105,18 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         max_tokens=args.verifier_max_tokens,
     )
-    answer_client = OpenAICompatibleClient(
-        args.answer_base_url,
-        args.answer_model,
-        args.answer_api_key,
-    )
+    if args.answer_backend == "hf-qwen-vl":
+        answer_client = HFQwenVLClient(
+            args.answer_model,
+            device=args.answer_device,
+            dtype=args.answer_dtype,
+        )
+    else:
+        answer_client = OpenAICompatibleClient(
+            args.answer_base_url,
+            args.answer_model,
+            args.answer_api_key,
+        )
     answer_model = ChatAnswerModel(
         answer_client,
         max_tokens=args.answer_max_tokens,
@@ -272,39 +307,61 @@ def run_scenario(
     )
     round_summaries = []
     for round_index in range(args.distill_rounds):
+        round_dir = run_dir / f"round_{round_index:02d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        rollout_path = round_dir / "online_rollouts.jsonl"
+        buffer_path = run_dir / "online_sft_buffer.jsonl"
+        partial_metrics_path = round_dir / "partial_metrics.json"
         progress = ProgressBar(
             len(samples),
             f"{scenario} online r{round_index}",
             not args.no_progress,
         )
         results = []
-        for sample_index, sample in enumerate(samples, start=1):
-            result = distiller.collect_sample(
-                sample,
-                round_index=round_index,
-            )
-            results.append(result)
-            progress.update(
-                sample_index,
-                message=(
-                    f"student={int(result.student_answer_validation.correct)} "
-                    f"labels={len(result.corrections)}"
-                ),
-            )
-        progress.close()
-        round_dir = run_dir / f"round_{round_index:02d}"
-        round_dir.mkdir(parents=True, exist_ok=True)
-        rollout_path = round_dir / "online_rollouts.jsonl"
-        with rollout_path.open("w", encoding="utf-8") as handle:
-            for result in results:
-                handle.write(
+        with rollout_path.open("w", encoding="utf-8") as rollout_handle:
+            for sample_index, sample in enumerate(samples, start=1):
+                result = distiller.collect_sample(
+                    sample,
+                    round_index=round_index,
+                )
+                results.append(result)
+                rollout_handle.write(
                     json.dumps(result.to_dict(), ensure_ascii=False) + "\n"
                 )
-        buffer_path = run_dir / "online_sft_buffer.jsonl"
+                rollout_handle.flush()
+                buffer.write_jsonl(buffer_path)
+                partial_metrics = _round_metrics(results, len(buffer))
+                partial_metrics["round"] = round_index
+                partial_metrics["completed_samples"] = sample_index
+                partial_metrics["total_samples"] = len(samples)
+                partial_metrics["partial"] = sample_index < len(samples)
+                partial_metrics_path.write_text(
+                    json.dumps(
+                        partial_metrics,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                progress.update(
+                    sample_index,
+                    message=(
+                        f"student={int(result.student_answer_validation.correct)} "
+                        f"labels={len(result.corrections)}"
+                    ),
+                )
+        progress.close()
         buffer.write_jsonl(buffer_path)
         metrics = _round_metrics(results, len(buffer))
         metrics["round"] = round_index
+        metrics["completed_samples"] = len(results)
+        metrics["total_samples"] = len(samples)
+        metrics["partial"] = False
         (round_dir / "metrics.json").write_text(
+            json.dumps(metrics, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        partial_metrics_path.write_text(
             json.dumps(metrics, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -398,20 +455,41 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--vision-mode", choices=["siglip", "off"], default="siglip")
     parser.add_argument("--vision-model", default=default_siglip_model())
     parser.add_argument("--vision-device", default="cuda:0")
+    parser.add_argument(
+        "--student-backend",
+        choices=["openai", "hf-qwen-vl"],
+        default="openai",
+    )
     parser.add_argument("--student-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--student-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--student-api-key", default="ollama")
+    parser.add_argument("--student-device", default="cuda:1")
+    parser.add_argument("--student-dtype", default="auto")
+    parser.add_argument(
+        "--teacher-backend",
+        choices=["openai", "hf-qwen-vl"],
+        default="openai",
+    )
     parser.add_argument("--teacher-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--teacher-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--teacher-api-key", default="ollama")
+    parser.add_argument("--teacher-device", default="cuda:1")
+    parser.add_argument("--teacher-dtype", default="auto")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
     parser.add_argument("--verifier-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--verifier-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--verifier-api-key", default="ollama")
     parser.add_argument("--verifier-max-tokens", type=int, default=192)
+    parser.add_argument(
+        "--answer-backend",
+        choices=["openai", "hf-qwen-vl"],
+        default="openai",
+    )
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument("--answer-device", default="cuda:1")
+    parser.add_argument("--answer-dtype", default="auto")
     parser.add_argument("--answer-max-tokens", type=int, default=128)
     parser.add_argument("--answer-max-images", type=int, default=3)
     parser.add_argument(

@@ -1,0 +1,7 @@
+FROM qwen3-vl:4b-instruct
+
+PARAMETER num_ctx 4096
+PARAMETER num_predict 768
+PARAMETER temperature 0
+PARAMETER top_k 20
+PARAMETER top_p 0.95

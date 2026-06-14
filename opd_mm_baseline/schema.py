@@ -28,6 +28,7 @@ READ_FIELDS = {
     "content",
     "ocr",
     "timestamp",
+    "session_date",
     "turn_id",
     "author",
     "modality",
@@ -52,7 +53,7 @@ FILTER(field=modality|author|source_type|timestamp|status,
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
 RETRIEVE(method=bm25|dense|hybrid, top_k=positive integer)
-READ(fields=[summary|content|ocr|timestamp|turn_id|author|modality|source_type|raw_pointer])
+READ(fields=[summary|content|ocr|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])
 STOP()
 
 Return only a JSON array of tool calls. Do not emit memory IDs. RETRIEVE always

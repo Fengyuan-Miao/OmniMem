@@ -14,6 +14,7 @@ from opd_mm_baseline.interactive import (
     InteractiveValidationError,
     StrictAnswerValidator,
     VerificationResult,
+    build_online_policy_prompt,
 )
 from opd_mm_baseline.memgallery_interactive_pipeline import (
     _select_sft_trajectory,
@@ -154,6 +155,48 @@ def test_executor_observation_is_hidden_until_pool_selection() -> None:
     assert "banana" in str(after.evidence_previews).lower()
 
 
+def test_online_policy_prompt_uses_compact_observation() -> None:
+    validator = InteractiveActionValidator()
+    session = ExecutorSession(
+        query="Which project did Bob select?",
+        memory_store=make_store(),
+        validator=validator,
+        retriever=TurnAwareHybridRetriever(context_window=0),
+    )
+    session.execute_chunk(
+        [
+            {
+                "tool": "RETRIEVE",
+                "method": "bm25",
+                "top_k": 2,
+                "query": "Bob banana project",
+            },
+            {
+                "tool": "READ",
+                "fields": [
+                    "summary",
+                    "content",
+                    "timestamp",
+                    "session_date",
+                    "turn_id",
+                    "raw_pointer",
+                ],
+            },
+        ]
+    )
+    prompt = build_online_policy_prompt(
+        "Which project did Bob select?",
+        session.history,
+        session.observation(),
+        validator.schema_text(),
+    )
+    assert "banana" in prompt.lower()
+    observation_json = prompt.split("Current executor observation:\n", 1)[1]
+    assert "raw_pointer" not in observation_json
+    assert "memory_id" not in observation_json
+    assert len(prompt) < 4500
+
+
 def test_expand_neighbors_uses_turn_order() -> None:
     session = ExecutorSession(
         query="banana",
@@ -280,10 +323,24 @@ class CapturingClient:
         self.prompt = ""
 
     def complete(self, messages, max_tokens=512, temperature=0.0):
-        self.prompt = messages[0]["content"]
+        self.prompt = "\n".join(str(message["content"]) for message in messages)
         return (
             '{"candidates":[[{"tool":"RETRIEVE","method":"bm25",'
             '"top_k":2,"query":"banana"}]]}'
+        )
+
+
+class CapturingInspectRawClient(CapturingClient):
+    def complete(self, messages, max_tokens=512, temperature=0.0):
+        self.prompt = "\n".join(str(message["content"]) for message in messages)
+        return (
+            '{"candidates":[{"reflection":"visual evidence not inspected, '
+            'inspect current candidates",'
+            '"next_tool":"INSPECT_RAW",'
+            '"expected_gain":"raw visual details",'
+            '"actions":[{"tool":"INSPECT_RAW",'
+            '"target":"current_pool",'
+            '"instruction":"answer_query_related_visual_details"}]}]}'
         )
 
 
@@ -330,6 +387,52 @@ def test_chat_planner_reserves_evidence_branch_for_visible_pool() -> None:
         action.tool == "READ"
         for candidate in candidates
         for action in candidate
+    )
+
+
+def test_chat_planner_softly_prompts_visual_feedback_without_injection() -> None:
+    client = CapturingInspectRawClient()
+    validator = InteractiveActionValidator(allow_inspect_raw=True)
+    planner = ChatInteractivePlanner(client, validator)
+    session = ExecutorSession(
+        query="Which image matches the question?",
+        memory_store=make_store(),
+        validator=validator,
+        retriever=TurnAwareHybridRetriever(context_window=0),
+    )
+    session.execute_chunk(
+        [{"tool": "RETRIEVE", "method": "bm25", "top_k": 2}]
+    )
+    candidates = planner.propose(
+        query="Which image matches the question?",
+        history=session.history,
+        observation=session.observation(),
+        candidate_count=1,
+        privileged_feedback={
+            "continue_required": True,
+            "failure_diagnostic": {
+                "failure_type": "uninspected_visual_evidence",
+                "evidence_gap": "Visual memories are present.",
+                "recommended_change": "Use INSPECT_RAW on candidates.",
+            },
+        },
+    )
+    assert candidates[0][0].tool == "INSPECT_RAW"
+    assert "final JSON object" in client.prompt
+    assert "brief gap -> next step" in client.prompt
+    assert "visual/image gap" in client.prompt
+    assert "Use INSPECT_RAW on candidates." in client.prompt
+    signature = json.dumps(
+        [action.to_dict() for action in candidates[0]],
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    assert planner.last_candidate_sources[signature] == "planner"
+    assert planner.last_candidate_rationales[signature]["next_tool"] == (
+        "INSPECT_RAW"
+    )
+    assert "visual evidence" in (
+        planner.last_candidate_rationales[signature]["reflection"]
     )
 
 

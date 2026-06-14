@@ -185,6 +185,10 @@ class ToolExecutor:
                 field: item.memory.field_value(field)
                 for field in fields
             }
+            if "session_date" not in values:
+                values["session_date"] = item.memory.metadata.get(
+                    "session_date"
+                )
             if item.score:
                 values["retrieval_score"] = item.score
             evidence.append(
@@ -229,6 +233,9 @@ class ToolExecutor:
                         "image_label": (
                             f"turn={item.memory.turn_id}; "
                             f"context={context[:220]}"
+                        ),
+                        "session_date": item.memory.metadata.get(
+                            "session_date"
                         ),
                         "timestamp": item.memory.timestamp,
                         "turn_id": item.memory.turn_id,

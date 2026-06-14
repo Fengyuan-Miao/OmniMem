@@ -46,12 +46,40 @@ DEFAULT_READ_FIELDS = [
     "content",
     "ocr",
     "timestamp",
+    "session_date",
     "turn_id",
     "author",
     "modality",
     "source_type",
     "raw_pointer",
 ]
+
+
+def raw_inspect_chunk() -> List[ToolAction]:
+    return [
+        ToolAction(
+            "INSPECT_RAW",
+            {
+                "target": "current_pool",
+                "instruction": "answer_query_related_visual_details",
+            },
+        )
+    ]
+
+
+def _actions_signature(actions: List[ToolAction]) -> str:
+    return json.dumps(
+        [action.to_dict() for action in actions],
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def _clip_text(value: Any, limit: int = 240) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def _evidence_mentions_visual_content(item: EvidenceItem) -> bool:
@@ -86,7 +114,7 @@ def build_interactive_schema(allow_inspect_raw: bool = False) -> str:
         "SORT(field=timestamp|turn_id|score, order=asc|desc)",
         "TOPK(k=positive integer)",
         "EXPAND_NEIGHBORS(window=1|2|3)",
-        "READ(fields=[summary|content|ocr|timestamp|turn_id|author|modality|source_type|raw_pointer])",
+        "READ(fields=[summary|content|ocr|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])",
     ]
     if allow_inspect_raw:
         lines.extend(
@@ -398,6 +426,47 @@ def _clip(value: Any, limit: int = 320) -> Any:
     return value
 
 
+def _compact_prompt_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep planner observations short enough for 4k-context local models."""
+    compact: Dict[str, Any] = {}
+    preferred = [
+        "content",
+        "summary",
+        "visual_observation",
+        "linked_text_context",
+        "ocr",
+        "image_label",
+        "timestamp",
+        "session_date",
+        "turn_id",
+        "author",
+        "modality",
+        "source_type",
+    ]
+    text_limits = {
+        "content": 220,
+        "summary": 180,
+        "visual_observation": 220,
+        "linked_text_context": 180,
+        "ocr": 120,
+        "image_label": 80,
+    }
+    for key in preferred:
+        if key not in fields:
+            continue
+        value = fields[key]
+        limit = text_limits.get(key, 80)
+        if isinstance(value, list):
+            compact[key] = [_clip(item, limit) for item in value[:3]]
+        else:
+            compact[key] = _clip(value, limit)
+    return {
+        key: value
+        for key, value in compact.items()
+        if value is not None and value != "" and value != []
+    }
+
+
 @dataclass
 class InteractiveObservation:
     pool_record_count: int
@@ -424,6 +493,41 @@ class InteractiveObservation:
             "evidence_previews": self.evidence_previews,
             "stopped": self.stopped,
             "last_error": self.last_error,
+            "has_question_image": self.has_question_image,
+        }
+
+    def to_prompt_dict(self) -> Dict[str, Any]:
+        return {
+            "pool_record_count": self.pool_record_count,
+            "pool_turn_count": self.pool_turn_count,
+            "score_min": self.score_min,
+            "score_max": self.score_max,
+            "candidate_previews": [
+                {
+                    "rank": item.get("rank"),
+                    "score": item.get("score"),
+                    "timestamp": item.get("timestamp"),
+                    "modalities": item.get("modalities"),
+                    "source_types": item.get("source_types"),
+                    "summary": _clip(item.get("summary", ""), 180),
+                }
+                for item in self.candidate_previews[:3]
+            ],
+            "evidence_count": self.evidence_count,
+            "new_evidence_count": self.new_evidence_count,
+            "evidence_previews": [
+                {
+                    "source": item.get("source"),
+                    "fields": _compact_prompt_fields(
+                        item.get("fields", {})
+                        if isinstance(item.get("fields"), dict)
+                        else {}
+                    ),
+                }
+                for item in self.evidence_previews[-4:]
+            ],
+            "stopped": self.stopped,
+            "last_error": _clip(self.last_error, 180),
             "has_question_image": self.has_question_image,
         }
 
@@ -1076,8 +1180,174 @@ Executed action history:
 {json.dumps([action.to_dict() for action in history], ensure_ascii=False)}
 
 Current executor observation:
-{json.dumps(observation.to_dict(), ensure_ascii=False)}
+{json.dumps(observation.to_prompt_dict(), ensure_ascii=False)}
 """
+
+
+def build_compact_interactive_schema(allow_inspect_raw: bool = False) -> str:
+    tools = [
+        "RETRIEVE(method=bm25|dense|hybrid, top_k, query?, scope?)",
+        "READ(fields)",
+        "EXPAND_NEIGHBORS(window)",
+        "FILTER(field, op, value)",
+        "SORT(field, order)",
+        "TOPK(k)",
+    ]
+    if allow_inspect_raw:
+        tools.append("INSPECT_RAW(current_pool)")
+    tools.append("STOP()")
+    return ", ".join(tools)
+
+
+def _compact_feedback(feedback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not feedback:
+        return {}
+    compact = {
+        key: feedback[key]
+        for key in (
+            "answerable",
+            "relevance",
+            "completeness",
+            "continue_required",
+        )
+        if key in feedback
+    }
+    diagnostic = feedback.get("failure_diagnostic")
+    if isinstance(diagnostic, dict):
+        compact["failure_diagnostic"] = {
+            key: _clip_text(diagnostic.get(key), 180)
+            for key in (
+                "failure_type",
+                "evidence_gap",
+                "recommended_change",
+                "judge_reason",
+            )
+            if diagnostic.get(key)
+        }
+    return compact
+
+
+def _planner_observation_state(
+    observation: InteractiveObservation,
+) -> Dict[str, Any]:
+    prompt_observation = observation.to_prompt_dict()
+    return {
+        "pool": {
+            "records": observation.pool_record_count,
+            "turns": observation.pool_turn_count,
+            "score_min": observation.score_min,
+            "score_max": observation.score_max,
+        },
+        "candidates": [
+            {
+                "rank": item.get("rank"),
+                "score": item.get("score"),
+                "time": item.get("timestamp") or item.get("session_date"),
+                "modalities": item.get("modalities"),
+                "summary": _clip_text(item.get("summary"), 80),
+            }
+            for item in prompt_observation.get("candidate_previews", [])[:2]
+        ],
+        "evidence": {
+            "count": observation.evidence_count,
+            "new": observation.new_evidence_count,
+            "items": [
+                {
+                    "source": item.get("source"),
+                    "fields": _clip_text(item.get("fields"), 120),
+                }
+                for item in prompt_observation.get("evidence_previews", [])[-2:]
+            ],
+        },
+        "stopped": observation.stopped,
+        "last_error": _clip_text(observation.last_error, 120),
+        "has_question_image": observation.has_question_image,
+    }
+
+
+def build_compact_planner_prompt(
+    query: str,
+    history: List[ToolAction],
+    observation: InteractiveObservation,
+    allow_inspect_raw: bool,
+    candidate_count: int,
+    privileged_feedback: Optional[Dict[str, Any]] = None,
+) -> str:
+    payload = {
+        "q": query,
+        "history": [action.to_dict() for action in history],
+        "obs": _planner_observation_state(observation),
+    }
+    feedback = _compact_feedback(privileged_feedback)
+    if feedback:
+        payload["fb"] = feedback
+    return f"""Return a memory-tool policy JSON.
+
+State:
+{json.dumps(payload, ensure_ascii=False)}
+
+Tools:
+{build_compact_interactive_schema(allow_inspect_raw)}
+
+Constraints:
+- {max(1, candidate_count)} candidates; 1-3 actions each.
+- Pool-changing actions before READ/INSPECT_RAW.
+- No memory IDs or file paths.
+- If fb says visual/image gap, use INSPECT_RAW.
+
+Final JSON shape:
+{{"candidates":[{{"reflection":"brief gap -> next step","next_tool":"RETRIEVE","actions":[{{"tool":"RETRIEVE","method":"hybrid","top_k":5,"scope":"all"}}]}}]}}
+"""
+
+
+def _extract_candidates_object(raw: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(str(raw or "").strip())
+        if isinstance(value, dict) and isinstance(value.get("candidates"), list):
+            return value
+    except json.JSONDecodeError:
+        pass
+
+    text = str(raw or "")
+    candidates: List[Dict[str, Any]] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            current = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif current == "\\":
+                    escaped = True
+                elif current == '"':
+                    in_string = False
+                continue
+            if current == '"':
+                in_string = True
+            elif current == "{":
+                depth += 1
+            elif current == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        value = json.loads(text[start : index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if (
+                        isinstance(value, dict)
+                        and isinstance(value.get("candidates"), list)
+                    ):
+                        candidates.append(value)
+                    break
+    if candidates:
+        return candidates[-1]
+    if "[empty_content_with_reasoning]" in text:
+        raise ValueError("planner returned reasoning without final candidates JSON")
+    return extract_json_object(raw)
 
 
 def fallback_action_chunks(
@@ -1108,19 +1378,7 @@ def fallback_action_chunks(
             ]
         )
         if validator.allow_inspect_raw:
-            candidates.append(
-                [
-                    ToolAction(
-                        "INSPECT_RAW",
-                        {
-                            "target": "current_pool",
-                            "instruction": (
-                                "answer_query_related_visual_details"
-                            ),
-                        },
-                    )
-                ]
-            )
+            candidates.append(raw_inspect_chunk())
     else:
         candidates.append(
             [
@@ -1138,19 +1396,7 @@ def fallback_action_chunks(
             ]
         )
         if validator.allow_inspect_raw:
-            candidates.append(
-                [
-                    ToolAction(
-                        "INSPECT_RAW",
-                        {
-                            "target": "current_pool",
-                            "instruction": (
-                                "answer_query_related_visual_details"
-                            ),
-                        },
-                    )
-                ]
-            )
+            candidates.append(raw_inspect_chunk())
     validated = []
     for candidate in candidates:
         try:
@@ -1175,6 +1421,33 @@ class ChatInteractivePlanner:
         self.calls = 0
         self.last_raw_response = ""
         self.last_candidate_sources: Dict[str, str] = {}
+        self.last_candidate_rationales: Dict[str, Dict[str, str]] = {}
+
+    def _parse_candidate(
+        self,
+        candidate: Any,
+    ) -> tuple[Optional[List[ToolAction]], Dict[str, str]]:
+        rationale: Dict[str, str] = {}
+        action_values = candidate
+        if isinstance(candidate, dict):
+            action_values = candidate.get("actions")
+            rationale = {
+                "reflection": _clip_text(candidate.get("reflection"), 360),
+                "next_tool": _clip_text(candidate.get("next_tool"), 80),
+                "expected_gain": _clip_text(
+                    candidate.get("expected_gain"),
+                    240,
+                ),
+            }
+            rationale = {
+                key: value for key, value in rationale.items() if value
+            }
+        if not isinstance(action_values, list):
+            return None, {}
+        try:
+            return self.validator.repair(action_values), rationale
+        except Exception:
+            return None, {}
 
     def propose(
         self,
@@ -1185,89 +1458,75 @@ class ChatInteractivePlanner:
         privileged_feedback: Optional[Dict[str, Any]] = None,
     ) -> List[List[ToolAction]]:
         self.calls += 1
-        online_prompt = build_online_policy_prompt(
-            query,
-            history,
-            observation,
-            self.validator.schema_text(),
+        prompt = build_compact_planner_prompt(
+            query=query,
+            history=history,
+            observation=observation,
+            allow_inspect_raw=self.validator.allow_inspect_raw,
+            candidate_count=candidate_count,
+            privileged_feedback=privileged_feedback,
         )
-        feedback = (
-            "\nTraining-only verifier feedback for search (never included in "
-            "student input):\n"
-            + json.dumps(privileged_feedback, ensure_ascii=False)
-            if privileged_feedback
-            else ""
-        )
-        prompt = f"""{online_prompt}
-{feedback}
-
-Propose {max(1, candidate_count)} materially different candidate chunks.
-Prefer changing retrieval query, method, scope, neighbor expansion, or action
-ordering before merely increasing top_k. STOP only when observed evidence is
-sufficient and at least one READ or INSPECT_RAW has produced evidence.
-When training-only failure_diagnostic is present, directly address its
-evidence_gap and recommended_change. Do not repeat the failed action pattern.
-RETRIEVE changes the candidate pool but does not add answer evidence. After a
-useful candidate pool is visible, use READ with exactly the allowed fields.
-Do not add arguments such as limit, reason, filter, pool_record_id, or IDs.
-Pool-changing actions must precede READ.
-
-Return only JSON:
-{{"candidates": [[{{"tool": "RETRIEVE", ...}}, ...], ...]}}
-"""
         raw = self.client.complete(
-            [{"role": "user", "content": prompt}],
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Think in at most two short sentences, then write "
+                        "</think> and output only the final JSON object."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=self.max_tokens,
-            temperature=0.2,
+            temperature=0.0,
         )
         self.last_raw_response = raw
-        value = extract_json_object(raw)
+        value = _extract_candidates_object(raw)
         candidates = value.get("candidates")
         if not isinstance(candidates, list):
             raise ValueError("planner response has no candidates list")
         validated = []
         signatures = set()
         self.last_candidate_sources = {}
+        self.last_candidate_rationales = {}
         for candidate in candidates:
-            if not isinstance(candidate, list):
+            actions, rationale = self._parse_candidate(candidate)
+            if actions is None:
                 continue
-            try:
-                actions = self.validator.repair(candidate)
-            except Exception:
-                continue
-            signature = json.dumps(
-                [action.to_dict() for action in actions],
-                sort_keys=True,
-                ensure_ascii=False,
-            )
+            signature = _actions_signature(actions)
             if signature not in signatures:
                 validated.append(actions)
                 signatures.add(signature)
-                raw_signature = json.dumps(
-                    [
-                        ToolAction.from_dict(value).to_dict()
-                        for value in candidate
-                        if isinstance(value, dict)
-                    ],
-                    sort_keys=True,
-                    ensure_ascii=False,
-                )
-                self.last_candidate_sources[signature] = (
+                if isinstance(candidate, dict):
+                    raw_values = candidate.get("actions")
+                else:
+                    raw_values = candidate
+                raw_signature = ""
+                if isinstance(raw_values, list):
+                    raw_signature = json.dumps(
+                        [
+                            ToolAction.from_dict(value).to_dict()
+                            for value in raw_values
+                            if isinstance(value, dict)
+                        ],
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                source = (
                     "planner"
                     if raw_signature == signature
                     else "planner_repaired"
                 )
+                self.last_candidate_sources[signature] = source
+                if rationale:
+                    self.last_candidate_rationales[signature] = rationale
         fallback_chunks = fallback_action_chunks(
             observation,
             self.validator,
             candidate_count,
         )
         for actions in fallback_chunks:
-            signature = json.dumps(
-                [action.to_dict() for action in actions],
-                sort_keys=True,
-                ensure_ascii=False,
-            )
+            signature = _actions_signature(actions)
             if signature not in signatures:
                 validated.append(actions)
                 signatures.add(signature)
@@ -1312,6 +1571,7 @@ class InteractiveDecision:
     verification_after: VerificationResult
     planner_raw_response: str = ""
     action_source: str = "planner"
+    teacher_reflection: Dict[str, str] = field(default_factory=dict)
 
     def sft_example(
         self,
@@ -1345,6 +1605,7 @@ class InteractiveDecision:
                     self.privileged_feedback
                 ),
                 "action_source": self.action_source,
+                "teacher_reflection": self.teacher_reflection,
             },
         )
 
@@ -1605,6 +1866,13 @@ class InteractiveTeacherSearch:
                             {},
                         )
                     )
+                    candidate_rationales = dict(
+                        getattr(
+                            self.planner,
+                            "last_candidate_rationales",
+                            {},
+                        )
+                    )
                 except Exception:
                     chunks = fallback_action_chunks(
                         observation,
@@ -1615,6 +1883,7 @@ class InteractiveTeacherSearch:
                         chunks = [[ToolAction("STOP")]]
                     planner_raw = ""
                     candidate_sources = {}
+                    candidate_rationales = {}
                 for chunk in chunks:
                     if len(node.session.history) + len(chunk) > self.max_actions:
                         continue
@@ -1699,15 +1968,12 @@ class InteractiveTeacherSearch:
                         verification_after=verification,
                         planner_raw_response=planner_raw,
                         action_source=candidate_sources.get(
-                            json.dumps(
-                                [
-                                    action.to_dict()
-                                    for action in chunk
-                                ],
-                                sort_keys=True,
-                                ensure_ascii=False,
-                            ),
+                            _actions_signature(chunk),
                             "controller_fallback",
+                        ),
+                        teacher_reflection=candidate_rationales.get(
+                            _actions_signature(chunk),
+                            {},
                         ),
                     )
                     child = SearchNode(

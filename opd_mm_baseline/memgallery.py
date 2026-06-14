@@ -62,6 +62,7 @@ def scenario_records(
             turn_id = str(turn.get("round") or f"{session_id}:{turn_index}")
             common_metadata = {
                 "session_id": session_id,
+                "session_date": date_value,
                 "session_index": session_index,
                 "turn_index": turn_index,
                 "global_turn_index": global_turn,

@@ -1,0 +1,10 @@
+FROM /home/miaofy/models/Qwen3-VL-4B-Instruct-GGUF/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+
+TEMPLATE {{ .Prompt }}
+RENDERER qwen3-vl-instruct
+PARSER qwen3-vl-instruct
+PARAMETER num_ctx 4096
+PARAMETER num_predict 768
+PARAMETER temperature 0
+PARAMETER top_k 20
+PARAMETER top_p 0.95

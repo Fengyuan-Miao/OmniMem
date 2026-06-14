@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import mimetypes
 import re
@@ -107,6 +108,132 @@ def image_data_url(path: str | Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
+def _image_from_data_url(value: str) -> Any:
+    from PIL import Image
+
+    header, encoded = value.split(",", 1)
+    _mime = header.split(":", 1)[-1].split(";", 1)[0]
+    image = Image.open(io.BytesIO(base64.b64decode(encoded)))
+    return image.convert("RGB")
+
+
+class HFQwenVLClient:
+    """Local Qwen-VL client accepting the subset of OpenAI chat messages we use."""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        device: str = "cuda:1",
+        dtype: str = "auto",
+    ):
+        self.model_path = str(model_path)
+        self.device = device
+        self.dtype = dtype
+        self._model = None
+        self._processor = None
+
+    def _load(self) -> None:
+        if self._model is not None and self._processor is not None:
+            return
+        import torch
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+        target_device = self.device
+        if target_device.startswith("cuda") and not torch.cuda.is_available():
+            target_device = "cpu"
+        kwargs: Dict[str, Any] = {}
+        if self.dtype == "auto":
+            kwargs["dtype"] = "auto"
+        elif self.dtype:
+            kwargs["torch_dtype"] = getattr(torch, self.dtype)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self.model_path,
+            **kwargs,
+        )
+        model.to(target_device)
+        model.eval()
+        self._model = model
+        self._processor = AutoProcessor.from_pretrained(self.model_path)
+        self.device = target_device
+
+    def complete(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> str:
+        self._load()
+        assert self._model is not None
+        assert self._processor is not None
+        qwen_messages = self._convert_messages(messages)
+        inputs = self._processor.apply_chat_template(
+            qwen_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._model.device)
+        generation_kwargs: Dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
+        import torch
+
+        with torch.inference_mode():
+            generated_ids = self._model.generate(**inputs, **generation_kwargs)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids) :]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        output = self._processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        return str(output[0] if output else "").strip()
+
+    @classmethod
+    def _convert_messages(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        converted = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                items = [{"type": "text", "text": content}]
+            elif isinstance(content, list):
+                items = [cls._convert_content_item(item) for item in content]
+            else:
+                items = [{"type": "text", "text": str(content)}]
+            converted.append(
+                {
+                    "role": str(message.get("role") or "user"),
+                    "content": [item for item in items if item],
+                }
+            )
+        return converted
+
+    @staticmethod
+    def _convert_content_item(item: Dict[str, Any]) -> Dict[str, Any]:
+        item_type = item.get("type")
+        if item_type == "text":
+            return {"type": "text", "text": str(item.get("text") or "")}
+        if item_type == "image_url":
+            url = item.get("image_url", {}).get("url", "")
+            if isinstance(url, str) and url.startswith("data:image/"):
+                image = _image_from_data_url(url)
+            else:
+                image = str(url)
+            return {"type": "image", "image": image}
+        if item_type == "image":
+            return {"type": "image", "image": item.get("image")}
+        return {"type": "text", "text": json.dumps(item, ensure_ascii=False)}
+
+
 class OpenAICompatibleClient:
     def __init__(
         self,
@@ -146,7 +273,19 @@ class OpenAICompatibleClient:
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(request, timeout=self.timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
-        return str(body["choices"][0]["message"].get("content") or "").strip()
+        message = body["choices"][0]["message"]
+        content = str(message.get("content") or "").strip()
+        if content:
+            if "</think>" in content:
+                content = content.split("</think>", 1)[1].strip()
+            return content
+        reasoning = str(message.get("reasoning") or "").strip()
+        if reasoning:
+            return (
+                "[empty_content_with_reasoning]\n"
+                + reasoning
+            )
+        return ""
 
 
 def build_student_prompt(
@@ -566,6 +705,10 @@ When a question image is present, compare it with the labeled memory images.
 Prefer explicit memory text labels over unsupported fine-grained visual breed or
 identity guesses. If visual evidence and memory text conflict, explain using the
 best supported memory evidence.
+For relative time expressions such as yesterday, today, tomorrow, last week, or
+next day, resolve them relative to the evidence field session_date. Do not use
+the turn timestamp as the event date unless the evidence explicitly says the
+event happened on that timestamp.
 
 User query:
 {query}

@@ -3,11 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from opd_mm_baseline.clients import ChatHindsightTeacher, extract_json_array
+from opd_mm_baseline.clients import (
+    ChatAnswerModel,
+    ChatHindsightTeacher,
+    extract_json_array,
+)
 from opd_mm_baseline.executor import ToolExecutor
 from opd_mm_baseline.memgallery import build_scenario_store, scenario_samples
 from opd_mm_baseline.memgallery_pipeline import select_sft_example
 from opd_mm_baseline.models import (
+    EvidenceItem,
     MemoryRecord,
     OPDSample,
     PolicyOutput,
@@ -126,6 +131,28 @@ class CapturingClient:
     def complete(self, messages, max_tokens=512, temperature=0.0):
         self.messages.append(messages)
         return self.response
+
+
+class CapturingRawInspector:
+    def __init__(self):
+        self.calls = []
+
+    def inspect(
+        self,
+        image_path,
+        query,
+        question_image=None,
+        text_context=None,
+    ):
+        self.calls.append(
+            {
+                "image_path": image_path,
+                "query": query,
+                "question_image": question_image,
+                "text_context": text_context,
+            }
+        )
+        return "same visual type; text label says Cairn Terrier"
 
 
 def test_validator_rejects_memory_ids_and_custom_search_queries():
@@ -359,6 +386,132 @@ def test_question_image_visual_route_ranks_and_expands_matching_turn():
         "D1:1:turn",
         "D1:1:image:1",
     ]
+
+
+def test_inspect_raw_receives_question_image_and_turn_text_context():
+    records = [
+        MemoryRecord(
+            "D1:1:turn",
+            "D1:1",
+            "2026-01-01T00:00:00Z",
+            "user",
+            "text",
+            "conversation",
+            summary="Amy has a Cairn Terrier.",
+            metadata={"session_date": "2026-01-01"},
+        ),
+        MemoryRecord(
+            "D1:1:image:1",
+            "D1:1",
+            "2026-01-01T00:00:01Z",
+            "user",
+            "image",
+            "uploaded_image",
+            raw_pointer="/tmp/support-memory.jpg",
+            metadata={"session_date": "2026-01-01"},
+        ),
+    ]
+    inspector = CapturingRawInspector()
+    result = ToolExecutor(
+        raw_inspector=inspector,
+        max_raw_inspections=1,
+    ).run(
+        [
+            ToolAction("TOPK", {"k": 1}),
+            ToolAction(
+                "INSPECT_RAW",
+                {"target": "current_pool", "instruction": "answer_query_related_visual_details"},
+            ),
+            ToolAction("STOP"),
+        ],
+        "What breed is the dog in the attached image?",
+        HiddenMemoryStore(records),
+        question_image="/tmp/question.jpg",
+    )
+    assert result.raw_inspection_calls == 1
+    assert inspector.calls[0]["question_image"] == "/tmp/question.jpg"
+    assert "Cairn Terrier" in inspector.calls[0]["text_context"]
+    assert result.evidence[0].fields["linked_text_context"].startswith("Amy")
+    assert result.evidence[0].fields["session_date"] == "2026-01-01"
+
+
+def test_read_includes_session_date_even_when_not_requested():
+    records = [
+        MemoryRecord(
+            "D1:1:turn",
+            "D1:1",
+            "2024-05-23T00:02:10Z",
+            "user",
+            "text",
+            "conversation",
+            summary="I adopted a dog yesterday.",
+            metadata={"session_date": "2024-05-23"},
+        )
+    ]
+    result = ToolExecutor().run(
+        [
+            ToolAction("TOPK", {"k": 1}),
+            ToolAction("READ", {"fields": ["timestamp", "summary"]}),
+            ToolAction("STOP"),
+        ],
+        "When was the dog adopted?",
+        HiddenMemoryStore(records),
+    )
+    assert result.evidence[0].fields["session_date"] == "2024-05-23"
+
+
+def test_answer_model_labels_memory_images_in_multimodal_prompt(tmp_path):
+    question = tmp_path / "question.jpg"
+    memory = tmp_path / "memory.jpg"
+    question.write_bytes(b"fake-question")
+    memory.write_bytes(b"fake-memory")
+    client = CapturingClient("Cairn Terrier")
+    model = ChatAnswerModel(client, max_images=1)
+    answer = model.answer(
+        "What breed is the dog?",
+        [
+            EvidenceItem(
+                "D1:1:image:1",
+                {
+                    "turn_id": "D1:1",
+                    "summary": "Amy has a Cairn Terrier.",
+                    "image_label": "turn=D1:1; context=Amy has a Cairn Terrier.",
+                    "raw_pointer": str(memory),
+                },
+            )
+        ],
+        question_image=str(question),
+    )
+    assert answer == "Cairn Terrier"
+    content = client.messages[0][0]["content"]
+    text_parts = [
+        item["text"] for item in content if item.get("type") == "text"
+    ]
+    assert any("Question image" in text for text in text_parts)
+    assert any("Memory image 1" in text for text in text_parts)
+    assert any("Cairn Terrier" in text for text in text_parts)
+
+
+def test_answer_model_prompt_mentions_relative_time_session_date(tmp_path):
+    client = CapturingClient("2024-05-22")
+    model = ChatAnswerModel(client, max_images=0)
+    model.answer(
+        "When did Lena adopt her dog?",
+        [
+            EvidenceItem(
+                "D2:1:turn",
+                {
+                    "timestamp": "2024-05-23T00:02:10Z",
+                    "session_date": "2024-05-23",
+                    "content": "I finally adopted a Maltese dog yesterday!",
+                },
+            )
+        ],
+    )
+    prompt = client.messages[0][0]["content"]
+    assert "relative time expressions" in prompt
+    assert "session_date" in prompt
+    assert "2024-05-23" in prompt
 
 
 def test_topk_preserves_all_records_in_selected_turn():
