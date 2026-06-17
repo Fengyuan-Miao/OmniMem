@@ -20,8 +20,8 @@ from .models import OPDSample, SFTExample, ToolAction
 from .retrieval import TurnAwareHybridRetriever
 
 
-TRAINABLE_TEACHER_ACTION_SOURCES = {"planner"}
-SYSTEM_STOP_ACTION_SOURCES = {"verifier_stop"}
+TRAINABLE_TEACHER_ACTION_SOURCES = {"planner", "planner_repaired"}
+SYSTEM_STOP_ACTION_SOURCES = {"answer_stop", "verifier_stop"}
 
 
 def _is_trainable_teacher_path(decisions: List[Any]) -> bool:
@@ -40,6 +40,21 @@ def _is_trainable_teacher_path(decisions: List[Any]) -> bool:
     return True
 
 
+def _is_pure_stop_decision(decision: Any) -> bool:
+    return bool(decision.actions) and all(
+        action.tool == "STOP" for action in decision.actions
+    )
+
+
+def _is_distillable_teacher_decision(decision: Any) -> bool:
+    if decision.action_source in TRAINABLE_TEACHER_ACTION_SOURCES:
+        return True
+    return (
+        decision.action_source in SYSTEM_STOP_ACTION_SOURCES
+        and _is_pure_stop_decision(decision)
+    )
+
+
 class InteractivePlanner(Protocol):
     calls: int
 
@@ -54,6 +69,26 @@ class InteractivePlanner(Protocol):
         ...
 
 
+class AnswerGenerator(Protocol):
+    def answer(
+        self,
+        query: str,
+        evidence: List[Any],
+        question_image: Optional[str] = None,
+    ) -> str:
+        ...
+
+
+class AnswerJudge(Protocol):
+    def evaluate(
+        self,
+        query: str,
+        prediction: str,
+        gold_answer: str,
+    ) -> tuple[bool, float, str]:
+        ...
+
+
 @dataclass
 class OnlineCorrection:
     sample_id: str
@@ -62,6 +97,9 @@ class OnlineCorrection:
     teacher_actions: List[ToolAction]
     teacher_answer_validation: AnswerValidationResult
     example: SFTExample
+    student_raw_response: str = ""
+    teacher_action_source: str = ""
+    teacher_verification: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -70,12 +108,17 @@ class OnlineCorrection:
             "student_actions": [
                 action.to_dict() for action in self.student_actions
             ],
+            "student_raw_response": self.student_raw_response,
             "teacher_actions": [
                 action.to_dict() for action in self.teacher_actions
             ],
             "teacher_answer_validation": (
-                self.teacher_answer_validation.to_dict()
+                self.teacher_answer_validation.to_dict(
+                    include_reason=False
+                )
             ),
+            "teacher_action_source": self.teacher_action_source,
+            "teacher_verification": self.teacher_verification or {},
             "example": self.example.to_dict(),
         }
 
@@ -84,6 +127,7 @@ class OnlineCorrection:
 class OnlineSampleResult:
     sample_id: str
     student_actions: List[ToolAction]
+    student_evidence_sufficiency: AnswerValidationResult
     student_answer_validation: AnswerValidationResult
     corrections: List[OnlineCorrection]
     student_planner_calls: int
@@ -95,8 +139,15 @@ class OnlineSampleResult:
             "student_actions": [
                 action.to_dict() for action in self.student_actions
             ],
+            "student_evidence_sufficiency": (
+                self.student_evidence_sufficiency.to_dict(
+                    include_reason=False
+                )
+            ),
             "student_answer_validation": (
-                self.student_answer_validation.to_dict()
+                self.student_answer_validation.to_dict(
+                    include_reason=False
+                )
             ),
             "corrections": [
                 correction.to_dict() for correction in self.corrections
@@ -182,7 +233,7 @@ class OnlineDistillationBuffer:
                     value.example.sample_id,
                 ),
             ):
-                row = item.example.to_dict()
+                row = item.example.to_dict(include_metadata=True)
                 row["buffer"] = {
                     "first_round": item.first_round,
                     "last_round": item.last_round,
@@ -206,6 +257,8 @@ class OnlineSelfDistiller:
         teacher_search: InteractiveTeacherSearch,
         answer_validator: StrictAnswerValidator,
         validator: InteractiveActionValidator,
+        answer_model: Optional[AnswerGenerator] = None,
+        answer_judge: Optional[AnswerJudge] = None,
         retriever: Optional[TurnAwareHybridRetriever] = None,
         max_student_rounds: int = 3,
         max_student_actions: int = 9,
@@ -216,6 +269,8 @@ class OnlineSelfDistiller:
         self.student_planner = student_planner
         self.teacher_search = teacher_search
         self.answer_validator = answer_validator
+        self.answer_model = answer_model
+        self.answer_judge = answer_judge
         self.validator = validator
         self.retriever = retriever or TurnAwareHybridRetriever()
         self.max_student_rounds = max(1, int(max_student_rounds))
@@ -287,7 +342,9 @@ class OnlineSelfDistiller:
                     "selected_path_trainable": trainable_path,
                     "verification": teacher_result.verification.to_dict(),
                     "answer_validation": (
-                        teacher_result.answer_validation.to_dict()
+                        teacher_result.answer_validation.to_dict(
+                            include_reason=False
+                        )
                         if teacher_result.answer_validation is not None
                         else None
                     ),
@@ -320,6 +377,9 @@ class OnlineSelfDistiller:
                 student_actions = (
                     fallback[0] if fallback else [ToolAction("STOP")]
                 )
+            student_raw_response = str(
+                getattr(self.student_planner, "last_raw_response", "") or ""
+            ).strip()
 
             teacher_validation = teacher_result.answer_validation
             if (
@@ -327,42 +387,44 @@ class OnlineSelfDistiller:
                 and teacher_validation.correct
                 and teacher_result.decisions
             ):
-                decision = teacher_result.decisions[0]
-                is_trainable_source = (
-                    decision.action_source in TRAINABLE_TEACHER_ACTION_SOURCES
-                    and trainable_path
-                )
-                example = decision.sft_example(
-                    sample.sample_id,
-                    state_index,
-                    sample.query,
-                    self.validator.schema_text(),
-                )
-                example.sample_id = (
-                    f"{sample.sample_id}:online:{round_index}:{state_index}"
-                )
-                example.round_index = round_index
-                example.metadata.update(
-                    {
-                        "online_state_index": state_index,
-                        "student_actions": [
-                            action.to_dict() for action in student_actions
-                        ],
-                        "teacher_answer_score": teacher_validation.score,
-                        "teacher_action_source": decision.action_source,
-                        "trainable_teacher_source": is_trainable_source,
-                        "teacher_reflection": decision.teacher_reflection,
-                    }
-                )
-                correction = OnlineCorrection(
-                    sample_id=sample.sample_id,
-                    state_index=state_index,
-                    student_actions=list(student_actions),
-                    teacher_actions=list(decision.actions),
-                    teacher_answer_validation=teacher_validation,
-                    example=example,
-                )
-                if is_trainable_source:
+                for decision_index, decision in enumerate(
+                    teacher_result.decisions
+                ):
+                    if not _is_distillable_teacher_decision(decision):
+                        continue
+                    if not trainable_path:
+                        continue
+                    example = decision.sft_example(
+                        sample.sample_id,
+                        state_index,
+                        sample.query,
+                        self.validator.schema_text(),
+                        allow_inspect_raw=self.validator.allow_inspect_raw,
+                    )
+                    example.sample_id = (
+                        f"{sample.sample_id}:online:{round_index}:"
+                        f"{state_index}:{decision_index}"
+                    )
+                    example.round_index = round_index
+                    example.metadata.update(
+                        {
+                            "online_state_index": state_index,
+                            "teacher_decision_index": decision_index,
+                        }
+                    )
+                    correction = OnlineCorrection(
+                        sample_id=sample.sample_id,
+                        state_index=state_index,
+                        student_actions=list(student_actions),
+                        student_raw_response=student_raw_response,
+                        teacher_actions=list(decision.actions),
+                        teacher_answer_validation=teacher_validation,
+                        example=example,
+                        teacher_action_source=decision.action_source,
+                        teacher_verification=(
+                            decision.verification_after.to_dict()
+                        ),
+                    )
                     corrections.append(correction)
                     self.buffer.add(example, round_index)
 
@@ -372,15 +434,21 @@ class OnlineSelfDistiller:
 
         if not session.stopped:
             session.execute_chunk([ToolAction("STOP")])
-        student_validation = self.answer_validator.evaluate(
+        student_sufficiency = self.answer_validator.evaluate(
             sample.query,
             sample.gold_answer,
             session.evidence,
             question_image=question_image,
         )
+        student_validation = self._evaluate_student_answer_no_gold(
+            sample,
+            session,
+            question_image=question_image,
+        )
         return OnlineSampleResult(
             sample_id=sample.sample_id,
             student_actions=list(session.history),
+            student_evidence_sufficiency=student_sufficiency,
             student_answer_validation=student_validation,
             corrections=corrections,
             student_planner_calls=(
@@ -388,6 +456,53 @@ class OnlineSelfDistiller:
             ),
             teacher_attempts=teacher_attempts,
         )
+
+    def _evaluate_student_answer_no_gold(
+        self,
+        sample: OPDSample,
+        session: ExecutorSession,
+        question_image: Optional[str] = None,
+    ) -> AnswerValidationResult:
+        if not session.evidence:
+            return AnswerValidationResult(
+                correct=False,
+                score=0.0,
+                prediction="",
+                reason="No retrieved evidence was provided.",
+            )
+        if self.answer_model is None or self.answer_judge is None:
+            return self.answer_validator.evaluate(
+                sample.query,
+                sample.gold_answer,
+                session.evidence,
+                question_image=question_image,
+            )
+        try:
+            prediction = self.answer_model.answer(
+                sample.query,
+                session.evidence,
+                question_image=question_image,
+            )
+            correct, score, reason = self.answer_judge.evaluate(
+                sample.query,
+                prediction,
+                sample.gold_answer,
+            )
+            score = max(0.0, min(1.0, float(score)))
+            return AnswerValidationResult(
+                correct=bool(correct),
+                score=score,
+                prediction=prediction,
+                reason=str(reason or ""),
+            )
+        except Exception as exc:
+            return AnswerValidationResult(
+                correct=False,
+                score=0.0,
+                prediction="",
+                error=str(exc),
+                reason="No-gold answer validation failed.",
+            )
 
     def collect_round(
         self,

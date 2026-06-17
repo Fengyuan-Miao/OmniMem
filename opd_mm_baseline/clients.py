@@ -101,6 +101,23 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("unterminated JSON object")
 
 
+def extract_policy_action_values(text: str) -> List[Dict[str, Any]]:
+    """Extract executable actions from either old or reflection-style output."""
+    try:
+        return extract_json_array(text)
+    except Exception:
+        pass
+    value = extract_json_object(text)
+    if "tool" in value:
+        return [value]
+    actions = value.get("action")
+    if actions is None:
+        actions = value.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("policy output has no action/actions list")
+    return actions
+
+
 def image_data_url(path: str | Path) -> str:
     source = Path(path)
     mime = mimetypes.guess_type(source.name)[0] or "image/jpeg"
@@ -161,6 +178,7 @@ class HFQwenVLClient:
         messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.0,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> str:
         self._load()
         assert self._model is not None
@@ -252,14 +270,18 @@ class OpenAICompatibleClient:
         messages: List[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.0,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> str:
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if extra_body:
+            body.update(extra_body)
         payload = json.dumps(
-            {
-                "model": self.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
+            body,
         ).encode("utf-8")
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
@@ -282,7 +304,7 @@ class OpenAICompatibleClient:
         reasoning = str(message.get("reasoning") or "").strip()
         if reasoning:
             return (
-                "[empty_content_with_reasoning]\n"
+                "empty_content_with_reasoning:\n"
                 + reasoning
             )
         return ""
@@ -674,12 +696,10 @@ class ChatAnswerModel:
         self.max_tokens = max_tokens
         self.max_images = max(0, int(max_images))
 
-    def answer(
+    def _prepare_evidence(
         self,
-        query: str,
         evidence: List[EvidenceItem],
-        question_image: Optional[str] = None,
-    ) -> str:
+    ) -> tuple[List[Dict[str, Any]], List[tuple[str, str]]]:
         public_evidence = []
         image_entries: List[tuple[str, str]] = []
         for item in evidence:
@@ -698,24 +718,14 @@ class ChatAnswerModel:
                     f"modality={fields.get('modality', '')}"
                 )
                 image_entries.append((str(pointer), label))
-        prompt = f"""Answer the user query using only the retrieved memory evidence.
-If the evidence is insufficient, answer "Not mentioned." Be concise. Do not
-mention internal memory IDs or file paths.
-When a question image is present, compare it with the labeled memory images.
-Prefer explicit memory text labels over unsupported fine-grained visual breed or
-identity guesses. If visual evidence and memory text conflict, explain using the
-best supported memory evidence.
-For relative time expressions such as yesterday, today, tomorrow, last week, or
-next day, resolve them relative to the evidence field session_date. Do not use
-the turn timestamp as the event date unless the evidence explicitly says the
-event happened on that timestamp.
+        return public_evidence, image_entries
 
-User query:
-{query}
-
-Retrieved evidence:
-{json.dumps(public_evidence, ensure_ascii=False)}
-"""
+    def _messages_with_images(
+        self,
+        prompt: str,
+        image_entries: List[tuple[str, str]],
+        question_image: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         if question_image and Path(question_image).is_file():
             content.extend(
@@ -746,16 +756,107 @@ Retrieved evidence:
                     },
                 ]
             )
-        messages: List[Dict[str, Any]]
         if len(content) == 1:
-            messages = [{"role": "user", "content": prompt}]
-        else:
-            messages = [{"role": "user", "content": content}]
+            return [{"role": "user", "content": prompt}]
+        return [{"role": "user", "content": content}]
+
+    def answer(
+        self,
+        query: str,
+        evidence: List[EvidenceItem],
+        question_image: Optional[str] = None,
+    ) -> str:
+        public_evidence, image_entries = self._prepare_evidence(evidence)
+        prompt = f"""Answer the user query using only the retrieved memory evidence.
+If the evidence is insufficient, answer "Not mentioned." Be concise. Do not
+mention internal memory IDs or file paths.
+First determine which evidence is required by the query: textual facts,
+temporal order, multiple supporting mentions, or visible image content. Use
+memory images only when the answer genuinely depends on what is visible or on
+comparison with the question image. The mere presence of an image in a memory
+does not make it relevant to a textual question.
+For questions asking for all names, items, events, or candidates, aggregate
+every supported entity across the retrieved evidence rather than returning the
+first match. Do not invent missing members.
+When a question image is present, compare it with the labeled memory images.
+Prefer explicit memory text labels over unsupported fine-grained visual breed or
+identity guesses. If visual evidence and memory text conflict, explain using the
+best supported memory evidence.
+For relative time expressions such as yesterday, today, tomorrow, last week, or
+next day, resolve them relative to the evidence field session_date. Do not use
+the turn timestamp as the event date unless the evidence explicitly says the
+event happened on that timestamp.
+
+User query:
+{query}
+
+Retrieved evidence:
+{json.dumps(public_evidence, ensure_ascii=False)}
+"""
+        messages = self._messages_with_images(
+            prompt,
+            image_entries,
+            question_image=question_image,
+        )
         return self.client.complete(
             messages,
             max_tokens=self.max_tokens,
             temperature=0.0,
         )
+
+    def assess_evidence(
+        self,
+        query: str,
+        gold_answer: str,
+        evidence: List[EvidenceItem],
+        question_image: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        public_evidence, image_entries = self._prepare_evidence(evidence)
+        prompt = f"""Assess whether the retrieved memory evidence is sufficient
+for an answer model to answer the user query with the gold answer.
+
+You can use the retrieved text, metadata, question image, and memory images.
+Do not require exact wording; semantic support is enough. For list answers,
+all core entities in the gold answer must be supported. For yes/no answers,
+the evidence must support the same polarity. For image-id answers, the evidence
+must clearly identify the correct public image id. For "Not mentioned" or other
+absence claims, the evidence must cover the relevant subject well enough to
+justify that the requested fact is absent.
+
+If the evidence is insufficient, explain the missing information and recommend
+the next retrieval or inspection step. Do not invent evidence.
+
+Return only JSON:
+{{
+  "answerable": true,
+  "score": 1.0,
+  "predicted_answer": "short answer derivable from the evidence",
+  "failure_type": "",
+  "evidence_gap": "",
+  "recommended_change": "",
+  "reason": "short explanation"
+}}
+
+User query:
+{query}
+
+Gold answer:
+{gold_answer}
+
+Retrieved evidence:
+{json.dumps(public_evidence, ensure_ascii=False)}
+"""
+        messages = self._messages_with_images(
+            prompt,
+            image_entries,
+            question_image=question_image,
+        )
+        raw = self.client.complete(
+            messages,
+            max_tokens=max(self.max_tokens, 192),
+            temperature=0.0,
+        )
+        return extract_json_object(raw)
 
 
 class ChatAnswerJudge:
@@ -790,6 +891,76 @@ Prediction: {prediction}
         data = extract_json_object(raw)
         score = max(0.0, min(1.0, float(data.get("score", 0.0))))
         return bool(data.get("correct")), score, str(data.get("reason") or "")
+
+    def diagnose_failure(
+        self,
+        query: str,
+        prediction: str,
+        evidence: List[EvidenceItem],
+    ) -> Dict[str, str]:
+        public_evidence = []
+        for item in evidence[:12]:
+            fields = {
+                key: value
+                for key, value in item.fields.items()
+                if key != "raw_pointer"
+            }
+            text = json.dumps(fields, ensure_ascii=False, default=str)
+            public_evidence.append(
+                {
+                    "source": item.source,
+                    "fields": text[:600],
+                }
+            )
+        prompt = f"""Diagnose why the current evidence led to an incorrect answer.
+
+The answer has already been judged incorrect. Identify why the CURRENT
+EVIDENCE failed, without quoting or revealing the gold answer itself.
+
+Failure types:
+- missing_text_evidence: required textual fact is absent from evidence.
+- incomplete_multi_support: evidence/prediction contains only part of a list,
+  comparison, sequence, or other multi-item answer.
+- missing_visual_evidence: the question genuinely requires visible image
+  content, but no raw visual observation was inspected.
+- wrong_visual_candidates: raw images were inspected, but they are not the
+  relevant images or do not contain the required visual support.
+- conflicting_evidence: retrieved evidence supports incompatible answers.
+- answer_reasoning_error: sufficient evidence is present, but the answer model
+  interpreted, aggregated, compared, or calculated it incorrectly.
+
+Do not select a visual failure merely because some memory records contain
+images. Textual questions should receive a textual or multi-support diagnosis.
+Recommendations must describe the next retrieval operation, not reveal the
+gold answer.
+
+Return only JSON:
+{{
+  "failure_type": "missing_text_evidence",
+  "evidence_gap": "short description of what kind of support is absent",
+  "recommended_change": "short actionable retrieval or evidence step"
+}}
+
+Question: {query}
+Prediction: {prediction}
+Current evidence:
+{json.dumps(public_evidence, ensure_ascii=False)}
+"""
+        raw = self.client.complete(
+            [{"role": "user", "content": prompt}],
+            max_tokens=self.max_tokens,
+            temperature=0.0,
+        )
+        data = extract_json_object(raw)
+        return {
+            key: str(data.get(key) or "").strip()
+            for key in (
+                "failure_type",
+                "evidence_gap",
+                "recommended_change",
+            )
+            if data.get(key)
+        }
 
 
 class HeuristicAnswerJudge:

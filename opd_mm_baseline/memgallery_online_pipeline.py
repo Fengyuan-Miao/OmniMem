@@ -27,7 +27,6 @@ from .clients import (
     OpenAICompatibleClient,
 )
 from .interactive import (
-    ChatGoldEvidenceVerifier,
     ChatInteractivePlanner,
     InteractiveActionValidator,
     InteractiveTeacherSearch,
@@ -83,6 +82,9 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
+        thinking_token_budget=args.planner_thinking_token_budget,
+        prompt_mode=args.student_prompt_mode,
+        enable_thinking=getattr(args, "student_planner_enable_thinking", None),
     )
     teacher_planner = ChatInteractivePlanner(
         _make_chat_client(
@@ -96,14 +98,9 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
-    )
-    evidence_verifier = ChatGoldEvidenceVerifier(
-        OpenAICompatibleClient(
-            args.verifier_base_url,
-            args.verifier_model,
-            args.verifier_api_key,
-        ),
-        max_tokens=args.verifier_max_tokens,
+        thinking_token_budget=args.planner_thinking_token_budget,
+        prompt_mode=args.teacher_prompt_mode,
+        enable_thinking=getattr(args, "teacher_planner_enable_thinking", None),
     )
     if args.answer_backend == "hf-qwen-vl":
         answer_client = HFQwenVLClient(
@@ -143,13 +140,13 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
     retriever = TurnAwareHybridRetriever(args.hybrid_alpha)
     teacher_search = InteractiveTeacherSearch(
         planner=teacher_planner,
-        verifier=evidence_verifier,
+        verifier=None,
         validator=validator,
         retriever=retriever,
         max_rounds=args.teacher_max_rounds,
         beam_size=args.teacher_beam_size,
         candidates_per_node=args.teacher_candidates,
-        max_actions=args.max_actions,
+        max_actions=args.teacher_max_actions,
         max_evidence=args.max_evidence,
         raw_inspector=raw_inspector,
         max_raw_inspections=args.max_raw_inspections,
@@ -159,6 +156,8 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         "validator": validator,
         "student_planner": student_planner,
         "teacher_search": teacher_search,
+        "answer_model": answer_model,
+        "judge": judge,
         "answer_validator": answer_validator,
         "retriever": retriever,
         "raw_inspector": raw_inspector,
@@ -178,13 +177,18 @@ def _round_metrics(results: List[Any], buffer_size: int) -> Dict[str, Any]:
         for attempt in result.teacher_attempts
         for diagnostic in attempt.get("failure_diagnostics", [])
     ]
-    student_failures = [
+    student_answer_failures = [
         result
         for result in results
         if not result.student_answer_validation.correct
     ]
+    student_sufficiency_failures = [
+        result
+        for result in results
+        if not result.student_evidence_sufficiency.correct
+    ]
     recovered_failures = [
-        result for result in student_failures if result.corrections
+        result for result in student_answer_failures if result.corrections
     ]
     feedback_assisted_recoveries = sum(
         any(
@@ -196,18 +200,43 @@ def _round_metrics(results: List[Any], buffer_size: int) -> Dict[str, Any]:
         for result in recovered_failures
     )
     corrections_from_failures = sum(
-        len(result.corrections) for result in student_failures
+        len(result.corrections) for result in student_answer_failures
     )
     return {
         "samples": count,
-        "student_strict_accuracy": (
+        "primary_metric": "student_answer_accuracy_no_gold",
+        "student_answer_accuracy_no_gold": (
             sum(result.student_answer_validation.correct for result in results)
             / count
             if count
             else 0.0
         ),
-        "student_answer_score": (
+        "student_answer_score_no_gold": (
             sum(result.student_answer_validation.score for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "student_evidence_sufficiency_gold_aware": (
+            sum(result.student_evidence_sufficiency.correct for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "student_evidence_sufficiency_score_gold_aware": (
+            sum(result.student_evidence_sufficiency.score for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "student_strict_accuracy": (
+            sum(result.student_evidence_sufficiency.correct for result in results)
+            / count
+            if count
+            else 0.0
+        ),
+        "student_answer_score": (
+            sum(result.student_evidence_sufficiency.score for result in results)
             / count
             if count
             else 0.0
@@ -222,11 +251,15 @@ def _round_metrics(results: List[Any], buffer_size: int) -> Dict[str, Any]:
             len(corrections) / count if count else 0.0
         ),
         "teacher_feedback_events": len(feedback_events),
-        "student_failure_count": len(student_failures),
+        "student_failure_count": len(student_answer_failures),
+        "student_answer_failure_count_no_gold": len(student_answer_failures),
+        "student_evidence_sufficiency_failure_count": (
+            len(student_sufficiency_failures)
+        ),
         "teacher_recovered_student_failures": len(recovered_failures),
         "teacher_failure_recovery_rate": (
-            len(recovered_failures) / len(student_failures)
-            if student_failures
+            len(recovered_failures) / len(student_answer_failures)
+            if student_answer_failures
             else 0.0
         ),
         "buffer_true_correction_fraction": (
@@ -235,8 +268,8 @@ def _round_metrics(results: List[Any], buffer_size: int) -> Dict[str, Any]:
             else 0.0
         ),
         "teacher_recovered_after_feedback_rate": (
-            feedback_assisted_recoveries / len(student_failures)
-            if student_failures
+            feedback_assisted_recoveries / len(student_answer_failures)
+            if student_answer_failures
             else 0.0
         ),
         "buffer_size": buffer_size,
@@ -297,6 +330,8 @@ def run_scenario(
         student_planner=components["student_planner"],
         teacher_search=components["teacher_search"],
         answer_validator=components["answer_validator"],
+        answer_model=components["answer_model"],
+        answer_judge=components["judge"],
         validator=components["validator"],
         retriever=components["retriever"],
         max_student_rounds=args.student_max_rounds,
@@ -347,6 +382,7 @@ def run_scenario(
                     sample_index,
                     message=(
                         f"student={int(result.student_answer_validation.correct)} "
+                        f"suff={int(result.student_evidence_sufficiency.correct)} "
                         f"labels={len(result.corrections)}"
                     ),
                 )
@@ -383,14 +419,26 @@ def run_scenario(
         "elapsed_seconds": time.time() - started,
         "student_model": args.student_model,
         "teacher_model": args.teacher_model,
+        "student_prompt_mode": args.student_prompt_mode,
+        "teacher_prompt_mode": args.teacher_prompt_mode,
         "self_distillation": args.student_model == args.teacher_model,
+        "teacher_assessment": (
+            "answer model receives gold answer and retrieved evidence during "
+            "training-time validation; separate evidence verifier is disabled"
+        ),
+        "student_primary_metric": "student_answer_accuracy_no_gold",
+        "student_secondary_metric": "student_evidence_sufficiency_gold_aware",
     }
     (run_dir / "metrics.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    config = vars(args) | {
+        "teacher_assessment": summary["teacher_assessment"],
+        "deprecated_verifier_args": "retained for old commands but not used",
+    }
     (run_dir / "config.json").write_text(
-        json.dumps(vars(args), ensure_ascii=False, indent=2, default=str),
+        json.dumps(config, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
     print(f"[INFO] Saved online self-distillation run: {run_dir}")
@@ -439,11 +487,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--max-questions", type=int, default=None)
     parser.add_argument("--distill-rounds", type=int, default=3)
-    parser.add_argument("--student-max-rounds", type=int, default=3)
-    parser.add_argument("--teacher-max-rounds", type=int, default=3)
+    parser.add_argument("--student-max-rounds", type=int, default=9)
+    parser.add_argument("--teacher-max-rounds", type=int, default=9)
+    parser.add_argument("--teacher-max-actions", type=int, default=9)
     parser.add_argument("--teacher-beam-size", type=int, default=2)
     parser.add_argument("--teacher-candidates", type=int, default=3)
-    parser.add_argument("--max-chunk-actions", type=int, default=3)
+    parser.add_argument("--max-chunk-actions", type=int, default=1)
     parser.add_argument("--max-actions", type=int, default=9)
     parser.add_argument("--max-top-k", type=int, default=50)
     parser.add_argument("--max-evidence", type=int, default=40)
@@ -476,6 +525,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--teacher-device", default="cuda:1")
     parser.add_argument("--teacher-dtype", default="auto")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
+    parser.add_argument("--planner-thinking-token-budget", type=int, default=256)
+    parser.add_argument(
+        "--student-prompt-mode",
+        choices=["student_simple", "teacher_compact"],
+        default="student_simple",
+    )
+    parser.add_argument(
+        "--teacher-prompt-mode",
+        choices=["teacher_compact", "student_simple"],
+        default="teacher_compact",
+    )
     parser.add_argument("--verifier-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--verifier-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--verifier-api-key", default="ollama")

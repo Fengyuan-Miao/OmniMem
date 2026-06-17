@@ -1,0 +1,403 @@
+_wandb:
+    value:
+        cli_version: 0.27.2
+        e:
+            2d2jr8mpt7e98hwp6bolkf8onn9nb2lf:
+                args:
+                    - --online-mode
+                    - streaming
+                    - --training-mode
+                    - full
+                    - --optimizer
+                    - paged_adamw8bit
+                    - --freeze-vision-tower
+                    - --freeze-token-embeddings
+                    - --all-scenarios
+                    - --max-questions
+                    - "15"
+                    - --student-max-rounds
+                    - "3"
+                    - --teacher-max-rounds
+                    - "5"
+                    - --teacher-max-actions
+                    - "15"
+                    - --teacher-beam-size
+                    - "2"
+                    - --teacher-candidates
+                    - "3"
+                    - --max-actions
+                    - "9"
+                    - --max-evidence
+                    - "40"
+                    - --dense-mode
+                    - minilm
+                    - --dense-device
+                    - cpu
+                    - --vision-mode
+                    - siglip
+                    - --vision-device
+                    - cpu
+                    - --val-ratio
+                    - "0"
+                    - --quality-filter
+                    - teacher-correct
+                    - --train-model
+                    - /home/miaofy/models/Qwen3-VL-4B-Thinking
+                    - --learning-rate
+                    - "1e-5"
+                    - --train-batch-size
+                    - "16"
+                    - --online-samples-per-rank
+                    - "2"
+                    - --gradient-accumulation-steps
+                    - "1"
+                    - --max-prompt-length
+                    - "896"
+                    - --max-completion-length
+                    - "128"
+                    - --distill-top-k
+                    - "32"
+                    - --accelerate-num-processes
+                    - "4"
+                    - --gpu-devices
+                    - 0,1,2,3
+                    - --report-to
+                    - wandb
+                    - --wandb-project
+                    - omnimem-opd
+                    - --wandb-run-name
+                    - memgallery300-opd-fullparams-b16
+                    - --wandb-group
+                    - memgallery300-fullparams
+                    - --wandb-mode
+                    - online
+                    - --proxy-url
+                    - http://127.0.0.1:7896
+                    - --save-steps
+                    - "0"
+                    - --save-final
+                    - --no-progress
+                    - --stream-worker
+                codePath: opd_mm_baseline/opd_online_train.py
+                codePathLocal: opd_mm_baseline/opd_online_train.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "910149308416"
+                        used: "432159395840"
+                email: miaofengyuan51@gmail.com
+                executable: /home/miaofy/SimpleMem/.venv/bin/python
+                git:
+                    commit: 92ff0d3780bc41b87a01b5cb4530c188cf82fe66
+                    remote: https://github.com/Fengyuan-Miao/OmniMem.git
+                gpu: NVIDIA GeForce RTX 4090
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-ea886a7d-f1a0-4e77-9eb4-8fae3be1c8bc
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-b2181577-e6b8-1ff6-39ad-d7df8c35eb8e
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-19782814-3a8d-a125-ed22-8e7a395a22f3
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-c541e894-3deb-8841-d3f0-b29459a29738
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-9c7f64c8-5922-cc88-5e26-d09985eaff81
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-9e7e0c45-d05d-0465-869a-d58e3e0ffff7
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-40ac1cba-a1e3-e775-48fa-6e3c4e3e4868
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-323629c3-80e1-3d39-c3be-0cd2cc31a0ef
+                host: 1aeb0bf2577d
+                memory:
+                    total: "270067965952"
+                os: Linux-5.15.0-78-generic-x86_64-with-glibc2.39
+                program: /home/miaofy/SimpleMem/OmniMem/opd_mm_baseline/opd_online_train.py
+                python: CPython 3.12.3
+                root: /home/miaofy/SimpleMem/OmniMem
+                startedAt: "2026-06-15T08:07:41.803063Z"
+                writerId: 2d2jr8mpt7e98hwp6bolkf8onn9nb2lf
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 98
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 53
+                - 71
+                - 75
+                - 98
+            "3":
+                - 13
+            "4": 3.12.3
+            "5": 0.27.2
+            "6": 5.12.0
+            "12": 0.27.2
+            "13": linux-x86_64
+accelerate_config_file:
+    value: None
+accelerate_num_processes:
+    value: "4"
+all_scenarios:
+    value: "True"
+allow_static_student:
+    value: "False"
+answer_api_key:
+    value: ollama
+answer_backend:
+    value: openai
+answer_base_url:
+    value: http://127.0.0.1:11435/v1
+answer_device:
+    value: cuda:1
+answer_dtype:
+    value: auto
+answer_max_images:
+    value: "3"
+answer_max_tokens:
+    value: "128"
+answer_model:
+    value: qwen3-vl-8b-instruct-ctx8k:latest
+bf16:
+    value: "True"
+data_dir:
+    value: /home/miaofy/SimpleMem/benchmark/Mem-Gallery
+dense_device:
+    value: cpu
+dense_mode:
+    value: minilm
+dense_model:
+    value: /home/miaofy/models/all-MiniLM-L6-v2
+distill_add_tail:
+    value: "True"
+distill_kl_weight:
+    value: "0.2"
+distill_rounds:
+    value: "1"
+distill_temperature:
+    value: "1.0"
+distill_top_k:
+    value: "32"
+dry_run:
+    value: "False"
+fp16:
+    value: "False"
+freeze_token_embeddings:
+    value: "True"
+freeze_vision_tower:
+    value: "True"
+gpu_devices:
+    value: 0,1,2,3
+gradient_accumulation_steps:
+    value: "1"
+gradient_checkpointing:
+    value: "True"
+hybrid_alpha:
+    value: "0.5"
+inspect_max_tokens:
+    value: "160"
+judge_api_key:
+    value: ollama
+judge_base_url:
+    value: http://127.0.0.1:11436/v1
+judge_max_tokens:
+    value: "192"
+judge_model:
+    value: gemma3-12b-it-q4km-judge:latest
+learning_rate:
+    value: "1e-05"
+logging_steps:
+    value: "5"
+lora_alpha:
+    value: "32"
+lora_dropout:
+    value: "0.0"
+lora_rank:
+    value: "16"
+max_actions:
+    value: "9"
+max_buffer_examples:
+    value: None
+max_chunk_actions:
+    value: "3"
+max_completion_length:
+    value: "128"
+max_evidence:
+    value: "40"
+max_grad_norm:
+    value: "1.0"
+max_prompt_length:
+    value: "896"
+max_questions:
+    value: "15"
+max_raw_inspections:
+    value: "3"
+max_scenarios:
+    value: None
+max_sessions:
+    value: None
+max_top_k:
+    value: "50"
+max_turns:
+    value: None
+min_answer_score:
+    value: "0.9"
+no_progress:
+    value: "True"
+online_mode:
+    value: streaming
+online_samples_per_rank:
+    value: "2"
+opd_rounds:
+    value: "3"
+optimizer:
+    value: paged_adamw8bit
+output_dir:
+    value: /home/miaofy/SimpleMem/OmniMem/runs/opd_online_train
+planner_max_tokens:
+    value: "768"
+planner_thinking_token_budget:
+    value: "256"
+proxy_url:
+    value: http://127.0.0.1:7896
+quality_filter:
+    value: teacher-correct
+raw_inspection:
+    value: "True"
+report_to:
+    value: wandb
+save_final:
+    value: "True"
+save_steps:
+    value: "0"
+scenario:
+    value: None
+scenarios:
+    value: None
+seed:
+    value: "13"
+split_seed:
+    value: "13"
+stream_worker:
+    value: "True"
+student_api_key:
+    value: ollama
+student_backend:
+    value: openai
+student_base_url:
+    value: http://127.0.0.1:11438/v1
+student_device:
+    value: cuda:1
+student_dtype:
+    value: auto
+student_enable_thinking:
+    value: "False"
+student_max_rounds:
+    value: "3"
+student_model:
+    value: qwen3-vl-4b-thinking-vllm
+student_prompt_mode:
+    value: student_simple
+student_reload_command:
+    value: None
+student_rollout_max_tokens:
+    value: "192"
+student_rollout_temperature:
+    value: "0.7"
+student_rollout_top_p:
+    value: "0.9"
+teacher_api_key:
+    value: ollama
+teacher_backend:
+    value: openai
+teacher_base_url:
+    value: http://127.0.0.1:11438/v1
+teacher_beam_size:
+    value: "2"
+teacher_candidates:
+    value: "3"
+teacher_device:
+    value: cuda:1
+teacher_dtype:
+    value: auto
+teacher_ema_decay:
+    value: "0.99"
+teacher_max_actions:
+    value: "15"
+teacher_max_rounds:
+    value: "5"
+teacher_model:
+    value: qwen3-vl-4b-thinking-vllm
+teacher_prompt_mode:
+    value: teacher_compact
+train_batch_size:
+    value: "16"
+train_epochs:
+    value: "1.0"
+train_launcher:
+    value: accelerate
+train_max_length:
+    value: "2048"
+train_model:
+    value: /home/miaofy/models/Qwen3-VL-4B-Thinking
+training_mode:
+    value: full
+val_ratio:
+    value: "0.0"
+vision_device:
+    value: cpu
+vision_mode:
+    value: siglip
+vision_model:
+    value: /home/miaofy/models/SigLIP-Base-Patch16-384
+wandb_entity:
+    value: None
+wandb_group:
+    value: memgallery300-fullparams
+wandb_mode:
+    value: online
+wandb_project:
+    value: omnimem-opd
+wandb_run_name:
+    value: memgallery300-opd-fullparams-b16
+weight_decay:
+    value: "0.0"

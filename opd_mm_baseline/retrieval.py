@@ -317,18 +317,35 @@ class HybridRetriever:
             return []
         bm25 = self._bm25_scores(pool, query)
         dense = self._dense_scores(pool, query, store)
+        vision = self._vision_scores(pool, query, store, question_image)
         if method == "bm25":
             scores = bm25
         elif method == "dense":
             scores = dense
+        elif method == "vision":
+            scores = vision
         else:
             sparse_norm = normalize_scores(bm25)
             dense_norm = normalize_scores(dense)
+            vision_norm = normalize_scores(vision)
+            has_vision = any(value != 0.0 for value in vision.values())
+            if has_vision and question_image:
+                vision_weight = 0.5
+            elif has_vision:
+                vision_weight = 0.2
+            else:
+                vision_weight = 0.0
+            text_weight = 1.0 - vision_weight
             scores = {
                 item.memory.memory_id: (
-                    self.hybrid_alpha * dense_norm.get(item.memory.memory_id, 0.0)
-                    + (1.0 - self.hybrid_alpha)
+                    text_weight
+                    * self.hybrid_alpha
+                    * dense_norm.get(item.memory.memory_id, 0.0)
+                    + text_weight
+                    * (1.0 - self.hybrid_alpha)
                     * sparse_norm.get(item.memory.memory_id, 0.0)
+                    + vision_weight
+                    * vision_norm.get(item.memory.memory_id, 0.0)
                 )
                 for item in pool
             }
@@ -480,6 +497,8 @@ class TurnAwareHybridRetriever(HybridRetriever):
             scores = bm25
         elif method == "dense":
             scores = dense
+        elif method == "vision":
+            scores = vision
         else:
             sparse_norm = normalize_scores(bm25)
             dense_norm = normalize_scores(dense)

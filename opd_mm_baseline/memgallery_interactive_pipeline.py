@@ -7,7 +7,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from dual_encoder_memory import MiniLMTextEncoder, SigLIPVisionEncoder
 from omnimem.config import (
@@ -26,7 +26,6 @@ from .clients import (
     OpenAICompatibleClient,
 )
 from .interactive import (
-    ChatGoldEvidenceVerifier,
     ChatInteractivePlanner,
     InteractiveActionValidator,
     InteractivePolicyRunner,
@@ -145,13 +144,52 @@ def _decision_rows(result: InteractiveSearchResult) -> List[Dict[str, Any]]:
             "observation": decision.observation.to_dict(),
             "actions": [action.to_dict() for action in decision.actions],
             "observation_after": decision.observation_after.to_dict(),
-            "verifier_feedback_used_by_teacher": decision.privileged_feedback,
+            "answer_feedback_used_by_teacher": decision.privileged_feedback,
             "verification_after": decision.verification_after.to_dict(),
             "planner_raw_response": decision.planner_raw_response,
             "action_source": decision.action_source,
         }
         for index, decision in enumerate(result.decisions)
     ]
+
+
+def _evidence_redundancy(evidence: List[EvidenceItem]) -> float:
+    if not evidence:
+        return 0.0
+    signatures = {
+        json.dumps(item.to_dict(), sort_keys=True, ensure_ascii=False)
+        for item in evidence
+    }
+    return max(0.0, 1.0 - (len(signatures) / len(evidence)))
+
+
+def _verification_from_answer_validation(
+    validation: Any,
+    evidence: List[EvidenceItem],
+    can_inspect_raw: bool,
+) -> VerificationResult:
+    redundancy = _evidence_redundancy(evidence)
+    if validation.correct:
+        return VerificationResult(
+            answerable=True,
+            relevance=1.0,
+            completeness=1.0,
+            redundancy=redundancy,
+            reason=validation.reason,
+        )
+    score = max(0.0, min(0.49, float(validation.score)))
+    return VerificationResult(
+        answerable=False,
+        relevance=score,
+        completeness=score,
+        redundancy=redundancy,
+        reason="Answer-model evidence assessment failed.",
+        error=validation.error,
+        diagnostic=validation.failure_feedback(
+            evidence,
+            can_inspect_raw=can_inspect_raw,
+        ),
+    )
 
 
 def _safe_judge(
@@ -185,14 +223,9 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
-    )
-    verifier = ChatGoldEvidenceVerifier(
-        OpenAICompatibleClient(
-            args.verifier_base_url,
-            args.verifier_model,
-            args.verifier_api_key,
-        ),
-        max_tokens=args.verifier_max_tokens,
+        thinking_token_budget=args.planner_thinking_token_budget,
+        prompt_mode=args.planner_prompt_mode,
+        enable_thinking=args.planner_enable_thinking,
     )
     needs_answer_services = (
         not args.teacher_recall_only
@@ -243,12 +276,12 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "validator": validator,
         "planner": planner,
-        "verifier": verifier,
         "answer_model": answer_model,
         "judge": judge,
+        "raw_inspector": raw_inspector,
         "teacher_search": InteractiveTeacherSearch(
             planner=planner,
-            verifier=verifier,
+            verifier=None,
             validator=validator,
             retriever=retriever,
             raw_inspector=raw_inspector,
@@ -311,7 +344,7 @@ def summarize(
         "strict_answer_validation_rate"
         if has_strict_validation
         else (
-            "verifier_answerable_rate"
+            "answer_assessment_answerable_rate"
             if teacher_recall_only
             else "answer_accuracy"
         )
@@ -325,6 +358,15 @@ def summarize(
             [float(row["correct"]) for row in rows]
         ),
         "answer_score": _average([float(row["score"]) for row in rows]),
+        "answer_assessment_answerable_rate": _average(
+            [float(row["verification"]["answerable"]) for row in rows]
+        ),
+        "answer_assessment_relevance": _average(
+            [float(row["verification"]["relevance"]) for row in rows]
+        ),
+        "answer_assessment_completeness": _average(
+            [float(row["verification"]["completeness"]) for row in rows]
+        ),
         "verifier_answerable_rate": _average(
             [float(row["verification"]["answerable"]) for row in rows]
         ),
@@ -418,6 +460,12 @@ def summarize(
                 "answer_accuracy": _average(
                     [float(item["correct"]) for item in items]
                 ),
+                "answer_assessment_answerable_rate": _average(
+                    [
+                        float(item["verification"]["answerable"])
+                        for item in items
+                    ]
+                ),
                 "verifier_answerable_rate": _average(
                     [
                         float(item["verification"]["answerable"])
@@ -469,6 +517,13 @@ def run_scenario(
         max_questions=args.max_questions,
         include_oracle_profile=False,
     )
+    excluded_sample_ids = load_excluded_sample_ids(args.exclude_sample_ids_file)
+    if excluded_sample_ids:
+        samples = [
+            sample
+            for sample in samples
+            if sample.sample_id not in excluded_sample_ids
+        ]
     for sample in samples:
         sample.metadata.pop("teacher_privileged_context", None)
 
@@ -484,6 +539,7 @@ def run_scenario(
     with predictions_path.open("w", encoding="utf-8") as prediction_handle:
         for index, sample in enumerate(samples, start=1):
             question_image = sample.metadata.get("question_image")
+            strict_validation = None
             if args.mode == "collect-sft":
                 search = components["teacher_search"].search(
                     query=sample.query,
@@ -499,6 +555,11 @@ def run_scenario(
                 answer_validator_calls = search.answer_validator_calls
                 candidates_evaluated = search.candidates_evaluated
                 decisions = _decision_rows(search)
+                strict_validation = (
+                    search.answer_validation
+                    if args.teacher_validation == "answer"
+                    else None
+                )
             else:
                 policy = components["policy_runner"].run(
                     query=sample.query,
@@ -508,16 +569,35 @@ def run_scenario(
                 execution = policy.execution
                 actions = [action.to_dict() for action in policy.actions]
                 planner_calls = policy.planner_calls
-                verifier_calls_before = components["verifier"].calls
-                verification = components["verifier"].evaluate(
-                    sample.query,
-                    sample.gold_answer,
-                    execution.evidence,
+                verifier_calls = 0
+                strict_validation = (
+                    components["answer_validator"].evaluate(
+                        sample.query,
+                        sample.gold_answer,
+                        execution.evidence,
+                        question_image=question_image,
+                    )
+                    if components["answer_validator"] is not None
+                    else None
                 )
-                verifier_calls = (
-                    components["verifier"].calls - verifier_calls_before
+                verification = (
+                    _verification_from_answer_validation(
+                        strict_validation,
+                        execution.evidence,
+                        can_inspect_raw=(
+                            args.raw_inspection
+                            and components["raw_inspector"] is not None
+                        ),
+                    )
+                    if strict_validation is not None
+                    else VerificationResult(
+                        answerable=bool(execution.evidence),
+                        relevance=1.0 if execution.evidence else 0.0,
+                        completeness=1.0 if execution.evidence else 0.0,
+                        redundancy=_evidence_redundancy(execution.evidence),
+                    )
                 )
-                answer_validator_calls = 0
+                answer_validator_calls = 1 if strict_validation is not None else 0
                 candidates_evaluated = 0
                 decisions = [
                     {"planner_raw_response": raw}
@@ -530,10 +610,7 @@ def run_scenario(
                 list(sample.metadata.get("gold_image_ids") or []),
             )
             strict_validation = (
-                search.answer_validation
-                if args.mode == "collect-sft"
-                and args.teacher_validation == "answer"
-                else None
+                strict_validation if args.teacher_validation == "answer" else None
             )
             if strict_validation is not None:
                 prediction = strict_validation.prediction
@@ -630,12 +707,14 @@ def run_scenario(
     )
     config = vars(args) | {
         "scenario": scenario,
+        "excluded_sample_count": len(excluded_sample_ids),
         "teacher_privilege": (
-            "gold answer visible only to post-action evidence verifier; "
+            "gold answer visible only to answer-side evidence assessment; "
             "planner sees query, action history, executor observations, and "
-            "coarse verifier feedback during teacher search"
+            "coarse answer-model feedback during teacher search"
         ),
         "student_sft_input_privilege": "none",
+        "deprecated_verifier_args": "retained for old commands but not used",
     }
     (run_dir / "config.json").write_text(
         json.dumps(config, ensure_ascii=False, indent=2, default=str),
@@ -644,6 +723,29 @@ def run_scenario(
     print(f"[INFO] Saved interactive OPD-MM run: {run_dir}")
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
     return run_dir
+
+
+def load_excluded_sample_ids(path: Optional[Path]) -> Set[str]:
+    if path is None:
+        return set()
+    excluded: Set[str] = set()
+    with path.expanduser().open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                value = json.loads(text)
+            except json.JSONDecodeError:
+                excluded.add(text)
+                continue
+            if isinstance(value, dict):
+                sample_id = value.get("sample_id")
+                if sample_id:
+                    excluded.add(str(sample_id))
+            elif isinstance(value, str):
+                excluded.add(value)
+    return excluded
 
 
 def run_scenarios(args: argparse.Namespace) -> List[Path]:
@@ -709,10 +811,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "the teacher trajectory."
         ),
     )
-    parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--max-rounds", type=int, default=9)
     parser.add_argument("--beam-size", type=int, default=2)
     parser.add_argument("--candidates-per-node", type=int, default=3)
-    parser.add_argument("--max-chunk-actions", type=int, default=3)
+    parser.add_argument("--max-chunk-actions", type=int, default=1)
     parser.add_argument("--max-actions", type=int, default=9)
     parser.add_argument("--max-top-k", type=int, default=50)
     parser.add_argument("--max-evidence", type=int, default=40)
@@ -731,6 +833,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--planner-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--planner-api-key", default="ollama")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
+    parser.add_argument("--planner-thinking-token-budget", type=int, default=256)
+    parser.add_argument(
+        "--planner-prompt-mode",
+        choices=["teacher_compact", "student_simple"],
+        default="teacher_compact",
+    )
+    parser.add_argument(
+        "--planner-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--exclude-sample-ids-file",
+        type=Path,
+        default=None,
+        help=(
+            "Plain-text sample IDs or JSONL rows with sample_id to exclude, "
+            "for held-out evaluation."
+        ),
+    )
     parser.add_argument("--verifier-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--verifier-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--verifier-api-key", default="ollama")

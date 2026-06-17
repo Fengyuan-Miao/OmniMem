@@ -22,7 +22,7 @@ FILTER_FIELDS = {"modality", "author", "source_type", "timestamp", "status"}
 FILTER_OPS = {"eq", "neq", "before", "after", "contains"}
 SORT_FIELDS = {"timestamp", "turn_id", "score"}
 SORT_ORDERS = {"asc", "desc"}
-RETRIEVAL_METHODS = {"bm25", "dense", "hybrid"}
+RETRIEVAL_METHODS = {"bm25", "dense", "vision", "hybrid"}
 READ_FIELDS = {
     "summary",
     "content",
@@ -52,7 +52,7 @@ FILTER(field=modality|author|source_type|timestamp|status,
        op=eq|neq|before|after|contains, value=...)
 SORT(field=timestamp|turn_id|score, order=asc|desc)
 TOPK(k=positive integer)
-RETRIEVE(method=bm25|dense|hybrid, top_k=positive integer)
+RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer)
 READ(fields=[summary|content|ocr|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])
 STOP()
 

@@ -161,14 +161,16 @@ class SFTExample:
     round_index: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_metadata: bool = False) -> Dict[str, Any]:
+        data = {
             "sample_id": self.sample_id,
             "input": self.input,
             "target": self.target,
             "round_index": self.round_index,
-            "metadata": self.metadata,
         }
+        if include_metadata:
+            data["metadata"] = self.metadata
+        return data
 
 
 @dataclass

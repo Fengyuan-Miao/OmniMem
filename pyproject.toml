@@ -27,6 +27,7 @@ gme = [
     "transformers>=4.45",
 ]
 all = [
+    "deepspeed>=0.19",
     "requests>=2.31",
     "sentence-transformers>=3",
     "torch>=2.1",
@@ -38,6 +39,7 @@ dev = [
 ]
 sft = [
     "accelerate>=1.0",
+    "deepspeed>=0.19",
     "torch>=2.1",
     "transformers>=4.45",
 ]

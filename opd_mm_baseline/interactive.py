@@ -7,7 +7,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
-from .clients import OpenAICompatibleClient, extract_json_object
+from .clients import (
+    OpenAICompatibleClient,
+    extract_json_array,
+    extract_json_object,
+    extract_policy_action_values,
+)
 from .executor import ToolExecutor
 from .models import (
     EvidenceItem,
@@ -82,32 +87,14 @@ def _clip_text(value: Any, limit: int = 240) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def _evidence_mentions_visual_content(item: EvidenceItem) -> bool:
-    if item.source == "INSPECT_RAW":
-        return True
-    fields = item.fields
-    if fields.get("raw_pointer") or fields.get("visual_observation"):
-        return True
-    modality_values = fields.get("modality", [])
-    source_values = fields.get("source_type", [])
-    values = (
-        modality_values
-        if isinstance(modality_values, list)
-        else [modality_values]
-    ) + (
-        source_values if isinstance(source_values, list) else [source_values]
-    )
-    return any(
-        token in str(value).lower()
-        for value in values
-        for token in ("image", "visual", "photo", "uploaded")
-    )
-
-
-def build_interactive_schema(allow_inspect_raw: bool = False) -> str:
+def build_interactive_schema(
+    allow_inspect_raw: bool = False,
+    max_chunk_actions: int = 3,
+) -> str:
+    atomic = max(1, int(max_chunk_actions)) == 1
     lines = [
         "Allowed executable tools:",
-        "RETRIEVE(method=bm25|dense|hybrid, top_k=positive integer,",
+        "RETRIEVE(method=bm25|dense|vision|hybrid, top_k=positive integer,",
         "         query=optional rewritten retrieval query, scope=all|current)",
         "FILTER(field=modality|author|source_type|timestamp|status,",
         "       op=eq|neq|before|after|contains, value=...)",
@@ -127,11 +114,18 @@ def build_interactive_schema(allow_inspect_raw: bool = False) -> str:
         [
             "STOP()",
             "",
-            "Return one short JSON array action chunk. RETRIEVE may rewrite the",
+            (
+                "The executable action list must contain exactly one executable action."
+                if atomic
+                else "The executable action list should be one short chunk."
+            ),
+            "RETRIEVE may rewrite the",
             "query using only the user request and observed evidence. Never emit",
-            "memory IDs or file paths. Pool-changing actions must occur before READ.",
+            "memory IDs or file paths.",
         ]
     )
+    if not atomic:
+        lines.append("Pool-changing actions must occur before READ.")
     return "\n".join(lines)
 
 
@@ -153,7 +147,10 @@ class InteractiveActionValidator:
         self.allow_inspect_raw = bool(allow_inspect_raw)
 
     def schema_text(self) -> str:
-        return build_interactive_schema(self.allow_inspect_raw)
+        return build_interactive_schema(
+            self.allow_inspect_raw,
+            max_chunk_actions=self.max_chunk_actions,
+        )
 
     def validate(
         self,
@@ -188,98 +185,100 @@ class InteractiveActionValidator:
         values: Iterable[Dict[str, Any] | ToolAction],
     ) -> List[ToolAction]:
         """Remove harmless schema drift without inventing semantic actions."""
+        if self.max_chunk_actions == 1:
+            for value in values:
+                repaired = self._repair_action(value)
+                try:
+                    return self.validate([repaired])
+                except InteractiveValidationError:
+                    continue
+            return self.validate([])
+
         repaired: List[ToolAction] = []
         for value in values:
-            action = (
-                value
-                if isinstance(value, ToolAction)
-                else ToolAction.from_dict(value)
-            )
-            args = action.arguments
-            if action.tool == "RETRIEVE":
-                top_k = args.get("top_k", 5)
-                if not isinstance(top_k, int) or isinstance(top_k, bool):
-                    top_k = 5
-                repaired_args: Dict[str, Any] = {
-                    "method": (
-                        args.get("method")
-                        if args.get("method") in RETRIEVAL_METHODS
-                        else "hybrid"
-                    ),
-                    "top_k": min(max(1, top_k), self.max_top_k),
-                }
-                query = args.get("query")
-                if isinstance(query, str) and query.strip():
-                    repaired_args["query"] = query.strip()[
-                        : self.max_query_chars
-                    ]
-                if args.get("scope") in RETRIEVE_SCOPES:
-                    repaired_args["scope"] = args["scope"]
-                repaired.append(ToolAction("RETRIEVE", repaired_args))
-            elif action.tool == "READ":
-                fields = args.get("fields")
-                if not isinstance(fields, list):
-                    fields = DEFAULT_READ_FIELDS
-                valid_fields = [
-                    field
-                    for field in fields
-                    if isinstance(field, str) and field in READ_FIELDS
-                ]
-                repaired.append(
-                    ToolAction(
-                        "READ",
-                        {"fields": valid_fields or list(DEFAULT_READ_FIELDS)},
-                    )
-                )
-            elif action.tool == "FILTER":
-                repaired.append(
-                    ToolAction(
-                        "FILTER",
-                        {
-                            key: args[key]
-                            for key in ("field", "op", "value")
-                            if key in args
-                        },
-                    )
-                )
-            elif action.tool == "SORT":
-                repaired.append(
-                    ToolAction(
-                        "SORT",
-                        {
-                            key: args[key]
-                            for key in ("field", "order")
-                            if key in args
-                        },
-                    )
-                )
-            elif action.tool == "TOPK":
-                repaired.append(
-                    ToolAction("TOPK", {"k": args.get("k")})
-                )
-            elif action.tool == "EXPAND_NEIGHBORS":
-                repaired.append(
-                    ToolAction(
-                        "EXPAND_NEIGHBORS",
-                        {"window": args.get("window", 1)},
-                    )
-                )
-            elif action.tool == "INSPECT_RAW":
-                repaired.append(
-                    ToolAction(
-                        "INSPECT_RAW",
-                        {
-                            key: args[key]
-                            for key in ("target", "instruction")
-                            if key in args
-                        },
-                    )
-                )
-            elif action.tool == "STOP":
-                repaired.append(ToolAction("STOP"))
-            else:
-                repaired.append(action)
+            repaired.append(self._repair_action(value))
         return self.validate(repaired)
+
+    def _repair_action(
+        self,
+        value: Dict[str, Any] | ToolAction,
+    ) -> ToolAction:
+        action = (
+            value
+            if isinstance(value, ToolAction)
+            else ToolAction.from_dict(value)
+        )
+        args = action.arguments
+        if action.tool == "RETRIEVE":
+            top_k = args.get("top_k", 5)
+            if not isinstance(top_k, int) or isinstance(top_k, bool):
+                top_k = 5
+            repaired_args: Dict[str, Any] = {
+                "method": (
+                    args.get("method")
+                    if args.get("method") in RETRIEVAL_METHODS
+                    else "hybrid"
+                ),
+                "top_k": min(max(1, top_k), self.max_top_k),
+            }
+            query = args.get("query")
+            if isinstance(query, str) and query.strip():
+                repaired_args["query"] = query.strip()[
+                    : self.max_query_chars
+                ]
+            if args.get("scope") in RETRIEVE_SCOPES:
+                repaired_args["scope"] = args["scope"]
+            return ToolAction("RETRIEVE", repaired_args)
+        if action.tool == "READ":
+            fields = args.get("fields")
+            if not isinstance(fields, list):
+                fields = DEFAULT_READ_FIELDS
+            valid_fields = [
+                field
+                for field in fields
+                if isinstance(field, str) and field in READ_FIELDS
+            ]
+            return ToolAction(
+                "READ",
+                {"fields": valid_fields or list(DEFAULT_READ_FIELDS)},
+            )
+        if action.tool == "FILTER":
+            return ToolAction(
+                "FILTER",
+                {
+                    key: args[key]
+                    for key in ("field", "op", "value")
+                    if key in args
+                },
+            )
+        if action.tool == "SORT":
+            return ToolAction(
+                "SORT",
+                {
+                    key: args[key]
+                    for key in ("field", "order")
+                    if key in args
+                },
+            )
+        if action.tool == "TOPK":
+            return ToolAction("TOPK", {"k": args.get("k")})
+        if action.tool == "EXPAND_NEIGHBORS":
+            return ToolAction(
+                "EXPAND_NEIGHBORS",
+                {"window": args.get("window", 1)},
+            )
+        if action.tool == "INSPECT_RAW":
+            return ToolAction(
+                "INSPECT_RAW",
+                {
+                    key: args[key]
+                    for key in ("target", "instruction")
+                    if key in args
+                },
+            )
+        if action.tool == "STOP":
+            return ToolAction("STOP")
+        return action
 
     def _validate_action(self, action: ToolAction, index: int) -> None:
         if action.tool not in INTERACTIVE_TOOLS:
@@ -476,6 +475,7 @@ class InteractiveObservation:
     candidate_previews: List[Dict[str, Any]]
     evidence_count: int
     new_evidence_count: int
+    last_retrieval_signature: Dict[str, Any]
     evidence_previews: List[Dict[str, Any]]
     stopped: bool
     last_error: str = ""
@@ -490,6 +490,7 @@ class InteractiveObservation:
             "candidate_previews": self.candidate_previews,
             "evidence_count": self.evidence_count,
             "new_evidence_count": self.new_evidence_count,
+            "last_retrieval_signature": self.last_retrieval_signature,
             "evidence_previews": self.evidence_previews,
             "stopped": self.stopped,
             "last_error": self.last_error,
@@ -515,6 +516,7 @@ class InteractiveObservation:
             ],
             "evidence_count": self.evidence_count,
             "new_evidence_count": self.new_evidence_count,
+            "last_retrieval_signature": self.last_retrieval_signature,
             "evidence_previews": [
                 {
                     "source": item.get("source"),
@@ -564,6 +566,8 @@ class ExecutorSession:
         self.error = ""
         self.raw_inspection_calls = 0
         self.pool_observable = False
+        self.last_chunk_new_evidence_count = 0
+        self.last_retrieval_signature: Dict[str, Any] = {}
 
     def clone(self) -> "ExecutorSession":
         cloned = ExecutorSession(
@@ -585,6 +589,12 @@ class ExecutorSession:
         cloned.error = self.error
         cloned.raw_inspection_calls = self.raw_inspection_calls
         cloned.pool_observable = self.pool_observable
+        cloned.last_chunk_new_evidence_count = (
+            self.last_chunk_new_evidence_count
+        )
+        cloned.last_retrieval_signature = dict(
+            self.last_retrieval_signature
+        )
         return cloned
 
     def execute_chunk(
@@ -626,6 +636,12 @@ class ExecutorSession:
                     retrieval_query = str(
                         action.arguments.get("query") or self.query
                     )
+                    self.last_retrieval_signature = {
+                        "method": action.arguments.get("method", "hybrid"),
+                        "top_k": action.arguments.get("top_k", 5),
+                        "query": retrieval_query,
+                        "scope": action.arguments.get("scope", "all"),
+                    }
                     self.pool = self.retriever.retrieve(
                         source,
                         query=retrieval_query,
@@ -678,9 +694,10 @@ class ExecutorSession:
             )
             if self.stopped or step_error:
                 break
-        return self.observation(
-            new_evidence_count=len(self.evidence) - evidence_before_chunk
+        self.last_chunk_new_evidence_count = (
+            len(self.evidence) - evidence_before_chunk
         )
+        return self.observation()
 
     def _append_evidence(self, values: List[EvidenceItem]) -> None:
         existing = {
@@ -737,7 +754,7 @@ class ExecutorSession:
         )
         return expanded
 
-    def observation(self, new_evidence_count: int = 0) -> InteractiveObservation:
+    def observation(self) -> InteractiveObservation:
         scores = [float(item.score) for item in self.pool]
         previews = []
         seen_turns = set()
@@ -787,7 +804,8 @@ class ExecutorSession:
             score_max=round(max(scores), 4) if scores else 0.0,
             candidate_previews=previews,
             evidence_count=len(self.evidence),
-            new_evidence_count=new_evidence_count,
+            new_evidence_count=self.last_chunk_new_evidence_count,
+            last_retrieval_signature=dict(self.last_retrieval_signature),
             evidence_previews=evidence_previews,
             stopped=self.stopped,
             last_error=self.error,
@@ -869,16 +887,20 @@ class AnswerValidationResult:
     reason: str = ""
     error: str = ""
     image_ids_match: Optional[bool] = None
+    diagnostic: Dict[str, str] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, include_reason: bool = True) -> Dict[str, Any]:
+        data = {
             "correct": self.correct,
             "score": self.score,
             "prediction": self.prediction,
-            "reason": self.reason,
             "error": self.error,
             "image_ids_match": self.image_ids_match,
+            "diagnostic": self.diagnostic,
         }
+        if include_reason:
+            data["reason"] = self.reason
+        return data
 
     def failure_feedback(
         self,
@@ -892,10 +914,6 @@ class AnswerValidationResult:
         has_raw_inspection = any(
             item.source == "INSPECT_RAW" for item in evidence
         )
-        has_visual_evidence = any(
-            _evidence_mentions_visual_content(item) for item in evidence
-        )
-
         if not evidence:
             failure_type = "no_evidence"
             evidence_gap = "No evidence has been read for the answer model."
@@ -919,18 +937,19 @@ class AnswerValidationResult:
                 if can_inspect_raw
                 else "Refine retrieval to isolate the relevant visual memories."
             )
-        elif has_visual_evidence and not has_raw_inspection:
-            failure_type = "uninspected_visual_evidence"
-            evidence_gap = (
-                "Visual memories are present, but the answer model could not "
-                "derive a correct answer from the currently read representation."
+        elif self.diagnostic:
+            failure_type = self.diagnostic.get(
+                "failure_type",
+                "answer_mismatch",
             )
-            recommended_change = (
-                "Use INSPECT_RAW on the strongest visual candidates, then "
-                "validate the answer again."
-                if can_inspect_raw
-                else "Reformulate retrieval to surface more discriminative "
-                "visual captions or surrounding context."
+            evidence_gap = self.diagnostic.get(
+                "evidence_gap",
+                "The current evidence does not support the required answer.",
+            )
+            recommended_change = self.diagnostic.get(
+                "recommended_change",
+                "Change the retrieval query or candidate pool, then read the "
+                "new evidence.",
             )
         elif has_raw_inspection:
             failure_type = "answer_mismatch_after_raw_inspection"
@@ -956,7 +975,6 @@ class AnswerValidationResult:
         diagnostic = {
             "failure_type": failure_type,
             "predicted_answer": _clip(self.prediction, 300),
-            "judge_reason": _clip(self.reason or self.error, 500),
             "answer_score": round(float(self.score), 4),
             "image_ids_match": self.image_ids_match,
             "evidence_gap": evidence_gap,
@@ -990,7 +1008,13 @@ class AnswerJudge(Protocol):
 
 
 class StrictAnswerValidator:
-    """Validate a trajectory through the actual answer model and judge."""
+    """Validate a trajectory through the answer model.
+
+    If the answer model exposes ``assess_evidence``, use it as the strict
+    training-time assessor: it sees the gold answer and current evidence, then
+    reports whether the evidence is sufficient and what is missing. Otherwise
+    fall back to answer generation followed by an external judge.
+    """
 
     def __init__(
         self,
@@ -1019,6 +1043,65 @@ class StrictAnswerValidator:
                 reason="No retrieved evidence was provided.",
             )
         try:
+            assess_evidence = getattr(
+                self.answer_model,
+                "assess_evidence",
+                None,
+            )
+            if callable(assess_evidence):
+                data = assess_evidence(
+                    query,
+                    gold_answer,
+                    evidence,
+                    question_image=question_image,
+                )
+                answerable = bool(data.get("answerable"))
+                try:
+                    score = float(
+                        data.get(
+                            "score",
+                            1.0 if answerable else 0.0,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    score = 1.0 if answerable else 0.0
+                score = max(0.0, min(1.0, score))
+                prediction = str(
+                    data.get("predicted_answer")
+                    or data.get("answer")
+                    or ""
+                )
+                reason = str(data.get("reason") or "")
+                gold_ids = set(PUBLIC_IMAGE_ID_PATTERN.findall(gold_answer))
+                predicted_ids = set(
+                    PUBLIC_IMAGE_ID_PATTERN.findall(prediction)
+                )
+                image_ids_match = (
+                    predicted_ids == gold_ids if gold_ids else None
+                )
+                correct = (
+                    answerable
+                    and score >= self.min_score
+                    and image_ids_match is not False
+                )
+                diagnostic = {
+                    key: str(data.get(key) or "")
+                    for key in (
+                        "failure_type",
+                        "evidence_gap",
+                        "recommended_change",
+                    )
+                    if data.get(key)
+                }
+                return AnswerValidationResult(
+                    correct=correct,
+                    score=score,
+                    prediction=prediction,
+                    reason=reason,
+                    image_ids_match=image_ids_match,
+                    diagnostic=diagnostic,
+                )
+
             prediction = self.answer_model.answer(
                 query,
                 evidence,
@@ -1042,12 +1125,28 @@ class StrictAnswerValidator:
                 and score >= self.min_score
                 and image_ids_match is not False
             )
+            diagnostic: Dict[str, str] = {}
+            diagnose_failure = getattr(
+                self.judge,
+                "diagnose_failure",
+                None,
+            )
+            if not correct and callable(diagnose_failure):
+                try:
+                    diagnostic = diagnose_failure(
+                        query,
+                        prediction,
+                        evidence,
+                    )
+                except Exception:
+                    diagnostic = {}
             return AnswerValidationResult(
                 correct=correct,
                 score=score,
                 prediction=prediction,
                 reason=str(reason or ""),
                 image_ids_match=image_ids_match,
+                diagnostic=diagnostic,
             )
         except Exception as exc:
             return AnswerValidationResult(
@@ -1184,19 +1283,88 @@ Current executor observation:
 """
 
 
+def build_simple_student_policy_prompt(
+    query: str,
+    history: List[ToolAction],
+    observation: InteractiveObservation,
+    schema: str,
+) -> str:
+    action_count = (
+        "exactly 1 tool action"
+        if "exactly one executable action" in schema
+        else "1-3 tool actions"
+    )
+    action_shape = (
+        "[{\"tool\":\"READ\",\"fields\":[\"summary\"]}]"
+        if "exactly one executable action" in schema
+        else "[{\"tool\":\"RETRIEVE\",\"method\":\"hybrid\",\"top_k\":5,\"scope\":\"all\"}]"
+    )
+    return f"""You are a memory-tool policy.
+Choose the next executable action.
+Use only the available tools and the current observation.
+Do not answer the user query. Do not assume hidden facts.
+Return only a JSON object with:
+- "reflection": one short student-visible diagnosis of the evidence gap.
+- "action": a JSON array of {action_count}.
+
+Do not mention hidden labels, hidden support, private signals, memory IDs, or
+file paths in the reflection.
+
+Available tools:
+{schema}
+
+User query:
+{query}
+
+Executed actions:
+{json.dumps([action.to_dict() for action in history], ensure_ascii=False)}
+
+Current observation:
+{json.dumps(observation.to_prompt_dict(), ensure_ascii=False)}
+
+Final JSON shape:
+{{"reflection":"brief reason for the next tool choice","action":{action_shape}}}
+"""
+
+
 def build_compact_interactive_schema(allow_inspect_raw: bool = False) -> str:
     tools = [
-        "RETRIEVE(method=bm25|dense|hybrid, top_k, query?, scope?)",
-        "READ(fields)",
-        "EXPAND_NEIGHBORS(window)",
-        "FILTER(field, op, value)",
-        "SORT(field, order)",
-        "TOPK(k)",
+        (
+            "RETRIEVE(method=bm25|dense|vision|hybrid, top_k, query?, scope?): "
+            "search memory and replace/extend the candidate pool; it does NOT "
+            "add answer evidence"
+        ),
+        (
+            "READ(fields): read text and metadata from the current candidate "
+            "pool into answer evidence"
+        ),
+        (
+            "EXPAND_NEIGHBORS(window): add nearby turns around current "
+            "candidates to recover surrounding context; it does NOT read them"
+        ),
+        (
+            "FILTER(field, op, value): narrow the current candidate pool by "
+            "metadata; it does NOT add evidence"
+        ),
+        (
+            "SORT(field, order): reorder the current candidate pool; it does "
+            "NOT add evidence"
+        ),
+        (
+            "TOPK(k): keep only the first k current candidates; it does NOT "
+            "add evidence"
+        ),
     ]
     if allow_inspect_raw:
-        tools.append("INSPECT_RAW(current_pool)")
-    tools.append("STOP()")
-    return ", ".join(tools)
+        tools.append(
+            "INSPECT_RAW(current_pool): inspect raw images in the current pool "
+            "and add query-relevant visual observations as evidence"
+        )
+    tools.append(
+        "STOP(): finish only when the accumulated evidence is sufficient to "
+        "answer; STOP does not retrieve or read anything"
+    )
+    return "\n".join(f"- {tool}" for tool in tools)
 
 
 def _compact_feedback(feedback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1220,7 +1388,6 @@ def _compact_feedback(feedback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "failure_type",
                 "evidence_gap",
                 "recommended_change",
-                "judge_reason",
             )
             if diagnostic.get(key)
         }
@@ -1259,6 +1426,7 @@ def _planner_observation_state(
                 for item in prompt_observation.get("evidence_previews", [])[-2:]
             ],
         },
+        "last_retrieval": observation.last_retrieval_signature,
         "stopped": observation.stopped,
         "last_error": _clip_text(observation.last_error, 120),
         "has_question_image": observation.has_question_image,
@@ -1272,6 +1440,7 @@ def build_compact_planner_prompt(
     allow_inspect_raw: bool,
     candidate_count: int,
     privileged_feedback: Optional[Dict[str, Any]] = None,
+    max_actions_per_candidate: int = 3,
 ) -> str:
     payload = {
         "q": query,
@@ -1281,6 +1450,37 @@ def build_compact_planner_prompt(
     feedback = _compact_feedback(privileged_feedback)
     if feedback:
         payload["fb"] = feedback
+    atomic = max(1, int(max_actions_per_candidate)) == 1
+    action_limit = (
+        "exactly 1 action each"
+        if atomic
+        else "1-3 actions each"
+    )
+    retrieve_guidance = (
+        "- RETRIEVE alone cannot support an answer. If you retrieve now, the "
+        "next observation must be used to decide whether to READ, filter, "
+        "inspect, or search again."
+        if atomic
+        else (
+            "- RETRIEVE alone cannot support an answer. Usually follow a "
+            "useful retrieval with READ in the same chunk, or INSPECT_RAW "
+            "when raw visual comparison is needed."
+        )
+    )
+    final_shape = (
+        '{"candidates":[{"reflection":"brief gap -> route choice -> next '
+        'step","next_tool":"RETRIEVE","actions":[{"tool":"RETRIEVE",'
+        '"method":"vision","top_k":5,"scope":"all"}]}]}'
+        if atomic
+        else (
+            '{"candidates":[{"reflection":"brief gap -> route choice -> '
+            'next step","next_tool":"RETRIEVE","actions":[{"tool":'
+            '"RETRIEVE","method":"vision","top_k":5,"scope":"all"},'
+            '{"tool":"READ","fields":["summary","content","ocr",'
+            '"timestamp","session_date","turn_id","author","modality",'
+            '"source_type","raw_pointer"]}]}]}'
+        )
+    )
     return f"""Return a memory-tool policy JSON.
 
 State:
@@ -1290,13 +1490,42 @@ Tools:
 {build_compact_interactive_schema(allow_inspect_raw)}
 
 Constraints:
-- {max(1, candidate_count)} candidates; 1-3 actions each.
+- {max(1, candidate_count)} candidates; {action_limit}.
 - Pool-changing actions before READ/INSPECT_RAW.
+- Analyze the query before choosing RETRIEVE.method.
+- Use bm25 for exact names, IDs, dates, quoted phrases, or distinctive words.
+- Use dense for semantic text memory when wording may differ.
+- Use vision for SigLIP visual search over memory images. Prefer it when
+  obs.has_question_image is true, or when the query asks what is visible,
+  which image matches, visual similarity, object identity, color, layout, or
+  fine-grained visual attributes.
+- Use hybrid when both text/caption clues and visual evidence are useful, or
+  when unsure which route should dominate.
+{retrieve_guidance}
+- If candidates exist but evidence is empty, read or inspect them instead of
+  repeating the same retrieval.
+- Do not STOP while relevant candidates remain unread or uninspected.
 - No memory IDs or file paths.
 - If fb says visual/image gap, use INSPECT_RAW.
 
-Final JSON shape:
-{{"candidates":[{{"reflection":"brief gap -> next step","next_tool":"RETRIEVE","actions":[{{"tool":"RETRIEVE","method":"hybrid","top_k":5,"scope":"all"}}]}}]}}
+Planning guidance:
+- evidence.new is the evidence added by the most recent action chunk.
+  last_retrieval is the exact retrieval that actually ran.
+- When evidence.new is 0, the last attempt made no progress. Repeating the
+  same retrieval is likely to return the same pool, so reconsider the search
+  rather than merely trying it again.
+- Use the observed evidence gap to make the next attempt meaningfully
+  different. Depending on the state, this may mean expressing the missing
+  concept in a focused query, changing retrieval breadth or method, exploring
+  neighboring turns, or inspecting relevant raw images.
+- The reflection and executable actions must agree. If the reflection says a
+  more targeted search or broader context is needed, the action parameters
+  should visibly implement that change.
+- Prefer a deliberate step whose effect can be judged from the next
+  observation.
+
+Final JSON shape (format example only; choose the method from query analysis):
+{final_shape}
 """
 
 
@@ -1357,6 +1586,35 @@ def fallback_action_chunks(
 ) -> List[List[ToolAction]]:
     """General recovery actions derived only from online executor state."""
     candidates: List[List[ToolAction]] = []
+    if validator.max_chunk_actions == 1:
+        if not observation.candidate_previews:
+            candidates.append(
+                [
+                    ToolAction(
+                        "RETRIEVE",
+                        {"method": "hybrid", "top_k": 5, "scope": "all"},
+                    )
+                ]
+            )
+        elif observation.evidence_count == 0:
+            candidates.append(
+                [ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)})]
+            )
+        else:
+            if validator.allow_inspect_raw:
+                candidates.append(raw_inspect_chunk())
+            candidates.append(
+                [ToolAction("EXPAND_NEIGHBORS", {"window": 1})]
+            )
+            candidates.append([ToolAction("STOP")])
+        validated = []
+        for candidate in candidates:
+            try:
+                validated.append(validator.validate(candidate))
+            except InteractiveValidationError:
+                continue
+        return validated[: max(1, candidate_count)]
+
     if not observation.candidate_previews:
         candidates.append(
             [
@@ -1407,17 +1665,25 @@ def fallback_action_chunks(
 
 
 class ChatInteractivePlanner:
-    """Gold-free planner used by both teacher search and the future student."""
+    """Planner used by student policy rollout and teacher search."""
 
     def __init__(
         self,
         client: OpenAICompatibleClient,
         validator: InteractiveActionValidator,
         max_tokens: int = 768,
+        thinking_token_budget: Optional[int] = None,
+        prompt_mode: str = "teacher_compact",
+        enable_thinking: Optional[bool] = None,
     ):
         self.client = client
         self.validator = validator
         self.max_tokens = max_tokens
+        self.thinking_token_budget = thinking_token_budget
+        self.enable_thinking = enable_thinking
+        if prompt_mode not in {"teacher_compact", "student_simple"}:
+            raise ValueError(f"invalid planner prompt mode: {prompt_mode}")
+        self.prompt_mode = prompt_mode
         self.calls = 0
         self.last_raw_response = ""
         self.last_candidate_sources: Dict[str, str] = {}
@@ -1449,6 +1715,54 @@ class ChatInteractivePlanner:
         except Exception:
             return None, {}
 
+    def _completion_kwargs(self) -> Dict[str, Any]:
+        completion_kwargs: Dict[str, Any] = {
+            "max_tokens": self.max_tokens,
+            "temperature": 0.0,
+        }
+        extra_body: Dict[str, Any] = {}
+        if self.thinking_token_budget is not None:
+            extra_body["thinking_token_budget"] = self.thinking_token_budget
+        if self.enable_thinking is not None:
+            extra_body["chat_template_kwargs"] = {
+                "enable_thinking": bool(self.enable_thinking)
+            }
+        if extra_body:
+            completion_kwargs["extra_body"] = extra_body
+        return completion_kwargs
+
+    def _propose_student_simple(
+        self,
+        query: str,
+        history: List[ToolAction],
+        observation: InteractiveObservation,
+    ) -> List[List[ToolAction]]:
+        prompt = build_simple_student_policy_prompt(
+            query=query,
+            history=history,
+            observation=observation,
+            schema=self.validator.schema_text(),
+        )
+        raw = self.client.complete(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Think privately if enabled, then output only the "
+                        "final JSON object with keys reflection and action."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            **self._completion_kwargs(),
+        )
+        self.last_raw_response = raw
+        actions = self.validator.repair(extract_policy_action_values(raw))
+        signature = _actions_signature(actions)
+        self.last_candidate_sources = {signature: "planner"}
+        self.last_candidate_rationales = {}
+        return [actions]
+
     def propose(
         self,
         query: str,
@@ -1458,6 +1772,8 @@ class ChatInteractivePlanner:
         privileged_feedback: Optional[Dict[str, Any]] = None,
     ) -> List[List[ToolAction]]:
         self.calls += 1
+        if self.prompt_mode == "student_simple":
+            return self._propose_student_simple(query, history, observation)
         prompt = build_compact_planner_prompt(
             query=query,
             history=history,
@@ -1465,6 +1781,7 @@ class ChatInteractivePlanner:
             allow_inspect_raw=self.validator.allow_inspect_raw,
             candidate_count=candidate_count,
             privileged_feedback=privileged_feedback,
+            max_actions_per_candidate=self.validator.max_chunk_actions,
         )
         raw = self.client.complete(
             [
@@ -1477,8 +1794,7 @@ class ChatInteractivePlanner:
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=self.max_tokens,
-            temperature=0.0,
+            **self._completion_kwargs(),
         )
         self.last_raw_response = raw
         value = _extract_candidates_object(raw)
@@ -1520,45 +1836,49 @@ class ChatInteractivePlanner:
                 self.last_candidate_sources[signature] = source
                 if rationale:
                     self.last_candidate_rationales[signature] = rationale
-        fallback_chunks = fallback_action_chunks(
-            observation,
-            self.validator,
-            candidate_count,
-        )
-        for actions in fallback_chunks:
-            signature = _actions_signature(actions)
-            if signature not in signatures:
-                validated.append(actions)
-                signatures.add(signature)
-                self.last_candidate_sources[signature] = "controller_fallback"
         if not validated:
             raise ValueError("planner produced no valid action chunks")
-        selected = validated[: max(1, candidate_count)]
-        if (
-            observation.candidate_previews
-            and not any(
-                action.tool in {"READ", "INSPECT_RAW"}
-                for actions in selected
-                for action in actions
-            )
-        ):
-            evidence_chunk = next(
-                (
-                    actions
-                    for actions in fallback_chunks
-                    if any(
-                        action.tool in {"READ", "INSPECT_RAW"}
-                        for action in actions
-                    )
-                ),
-                None,
-            )
-            if evidence_chunk is not None:
-                if len(selected) >= max(1, candidate_count):
-                    selected[-1] = evidence_chunk
-                else:
-                    selected.append(evidence_chunk)
-        return selected
+        return validated[: max(1, candidate_count)]
+
+
+def _default_reflection_for_actions(actions: List[ToolAction]) -> str:
+    tool = actions[0].tool if actions else "STOP"
+    if tool == "RETRIEVE":
+        return "Current evidence is insufficient, so search for a focused candidate pool."
+    if tool == "READ":
+        return "Candidates are available but evidence is incomplete, so read the memory fields."
+    if tool == "INSPECT_RAW":
+        return "The query depends on visual details, so inspect the retrieved raw images."
+    if tool == "FILTER":
+        return "The candidate pool needs a metadata constraint before reading evidence."
+    if tool == "SORT":
+        return "The candidate pool should be ordered before selecting evidence."
+    if tool == "TOPK":
+        return "The candidate pool should be narrowed to the most relevant entries."
+    if tool == "EXPAND_NEIGHBORS":
+        return "Neighboring turns may provide missing conversational context."
+    if tool == "STOP":
+        return "The available evidence is sufficient for the answer, so stop."
+    return "Choose the next tool that best reduces the current evidence gap."
+
+
+def reflection_action_target(
+    actions: List[ToolAction],
+    reflection: Optional[Dict[str, str]] = None,
+) -> str:
+    text = ""
+    if isinstance(reflection, dict):
+        text = _clip_text(reflection.get("reflection"), 220)
+    if not text:
+        text = _default_reflection_for_actions(actions)
+    return json.dumps(
+        {
+            "reflection": text,
+            "action": [action.to_dict() for action in actions],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @dataclass
@@ -1579,33 +1899,49 @@ class InteractiveDecision:
         step_index: int,
         query: str,
         schema: str,
+        allow_inspect_raw: bool = False,
     ) -> SFTExample:
+        student_input = build_simple_student_policy_prompt(
+            query,
+            self.history,
+            self.observation,
+            schema,
+        )
+        teacher_input = build_compact_planner_prompt(
+            query=query,
+            history=self.history,
+            observation=self.observation,
+            allow_inspect_raw=allow_inspect_raw,
+            candidate_count=1,
+            privileged_feedback=self.privileged_feedback,
+            max_actions_per_candidate=(
+                1
+                if "exactly one executable action" in schema
+                else 3
+            ),
+        )
         return SFTExample(
             sample_id=f"{sample_id}:step:{step_index}",
-            input=build_online_policy_prompt(
-                query,
-                self.history,
-                self.observation,
-                schema,
-            ),
-            target=json.dumps(
-                [action.to_dict() for action in self.actions],
-                ensure_ascii=False,
-                separators=(",", ":"),
+            input=student_input,
+            target=reflection_action_target(
+                self.actions,
+                self.teacher_reflection,
             ),
             round_index=step_index,
             metadata={
-                "answerable_after": self.verification_after.answerable,
-                "relevance_after": self.verification_after.relevance,
-                "completeness_after": self.verification_after.completeness,
                 "evidence_count_after": (
                     self.observation_after.evidence_count
                 ),
-                "privileged_feedback_used_for_teacher_search": bool(
-                    self.privileged_feedback
-                ),
-                "action_source": self.action_source,
-                "teacher_reflection": self.teacher_reflection,
+                "opd": {
+                    "student_prompt_template": "simple_tools_v1",
+                    "teacher_prompt_template": "compact_planner_v1",
+                    "teacher_input": teacher_input,
+                    "teacher_privileged_feedback_used": bool(
+                        self.privileged_feedback
+                    ),
+                    "action_source": self.action_source,
+                    "teacher_reflection": self.teacher_reflection,
+                },
             },
         )
 
@@ -1677,9 +2013,16 @@ class InteractiveSearchResult:
         sample_id: str,
         query: str,
         schema: str,
+        allow_inspect_raw: bool = False,
     ) -> List[SFTExample]:
         return [
-            decision.sft_example(sample_id, index, query, schema)
+            decision.sft_example(
+                sample_id,
+                index,
+                query,
+                schema,
+                allow_inspect_raw=allow_inspect_raw,
+            )
             for index, decision in enumerate(self.decisions)
         ]
 
@@ -1774,14 +2117,14 @@ class InteractiveTeacherSearch:
     def __init__(
         self,
         planner: ChatInteractivePlanner,
-        verifier: EvidenceVerifier,
+        verifier: Optional[EvidenceVerifier],
         validator: InteractiveActionValidator,
         retriever: Optional[TurnAwareHybridRetriever] = None,
         raw_inspector: Optional[Any] = None,
-        max_rounds: int = 3,
+        max_rounds: int = 5,
         beam_size: int = 2,
         candidates_per_node: int = 3,
-        max_actions: int = 9,
+        max_actions: int = 15,
         max_evidence: int = 40,
         max_raw_inspections: int = 3,
         answer_validator: Optional[StrictAnswerValidator] = None,
@@ -1798,6 +2141,87 @@ class InteractiveTeacherSearch:
         self.max_evidence = max(1, int(max_evidence))
         self.max_raw_inspections = max(0, int(max_raw_inspections))
         self.answer_validator = answer_validator
+
+    @staticmethod
+    def _evidence_redundancy(evidence: List[EvidenceItem]) -> float:
+        if not evidence:
+            return 0.0
+        signatures = {
+            (
+                item.memory_id,
+                item.source,
+                json.dumps(item.fields, sort_keys=True, default=str),
+            )
+            for item in evidence
+        }
+        return max(0.0, 1.0 - (len(signatures) / len(evidence)))
+
+    def _validate_candidate_evidence(
+        self,
+        query: str,
+        gold_answer: str,
+        evidence: List[EvidenceItem],
+        question_image: Optional[str],
+    ) -> tuple[VerificationResult, Optional[AnswerValidationResult]]:
+        redundancy = self._evidence_redundancy(evidence)
+        if self.answer_validator is None:
+            return (
+                VerificationResult(
+                    answerable=bool(evidence),
+                    relevance=1.0 if evidence else 0.0,
+                    completeness=1.0 if evidence else 0.0,
+                    redundancy=redundancy,
+                    reason=(
+                        "No answer validator configured; non-empty evidence "
+                        "is treated as tentatively answerable."
+                        if evidence
+                        else "No retrieved evidence was provided."
+                    ),
+                ),
+                None,
+            )
+
+        answer_validation = self.answer_validator.evaluate(
+            query,
+            gold_answer,
+            evidence,
+            question_image=question_image,
+        )
+        if answer_validation.correct:
+            return (
+                VerificationResult(
+                    answerable=True,
+                    relevance=1.0,
+                    completeness=1.0,
+                    redundancy=redundancy,
+                    reason=answer_validation.reason,
+                ),
+                answer_validation,
+            )
+
+        diagnostic = answer_validation.failure_feedback(
+            evidence,
+            can_inspect_raw=(
+                self.validator.allow_inspect_raw
+                and self.raw_inspector is not None
+            ),
+        )
+        partial_score = max(0.0, min(0.49, float(answer_validation.score)))
+        return (
+            VerificationResult(
+                answerable=False,
+                relevance=partial_score,
+                completeness=partial_score,
+                redundancy=redundancy,
+                reason=(
+                    "Answer-model evidence assessment failed: "
+                    + (answer_validation.reason or answer_validation.error)
+                ),
+                error=answer_validation.error,
+                diagnostic=diagnostic,
+            ),
+            answer_validation,
+        )
 
     def search(
         self,
@@ -1829,7 +2253,6 @@ class InteractiveTeacherSearch:
         candidates_evaluated = 0
         failure_diagnostics: List[Dict[str, Any]] = []
         planner_calls_before = getattr(self.planner, "calls", 0)
-        verifier_calls_before = getattr(self.verifier, "calls", 0)
         answer_validator_calls_before = getattr(
             self.answer_validator,
             "calls",
@@ -1892,72 +2315,44 @@ class InteractiveTeacherSearch:
                         observation_after = child_session.execute_chunk(chunk)
                     except Exception:
                         continue
-                    verification = self.verifier.evaluate(
-                        query,
-                        gold_answer,
-                        child_session.evidence,
-                    )
-                    answer_validation = None
-                    if (
-                        verification.answerable
-                        and self.answer_validator is not None
-                    ):
-                        answer_validation = self.answer_validator.evaluate(
+                    verification, answer_validation = (
+                        self._validate_candidate_evidence(
                             query,
                             gold_answer,
                             child_session.evidence,
-                            question_image=question_image,
+                            question_image,
                         )
-                        if not answer_validation.correct:
-                            diagnostic = answer_validation.failure_feedback(
-                                child_session.evidence,
-                                can_inspect_raw=(
-                                    self.validator.allow_inspect_raw
-                                    and self.raw_inspector is not None
-                                ),
-                            )
-                            verification = VerificationResult(
-                                answerable=False,
-                                relevance=verification.relevance,
-                                completeness=min(
-                                    verification.completeness,
-                                    0.49,
-                                ),
-                                redundancy=verification.redundancy,
-                                reason=(
-                                    "Strict answer validation failed: "
-                                    + (
-                                        answer_validation.reason
-                                        or answer_validation.error
+                    )
+                    if (
+                        answer_validation is not None
+                        and not answer_validation.correct
+                    ):
+                        failure_diagnostics.append(
+                            {
+                                "round_index": _round_index,
+                                "history": [
+                                    action.to_dict()
+                                    for action in node.session.history
+                                ],
+                                "candidate_actions": [
+                                    action.to_dict() for action in chunk
+                                ],
+                                "answer_validation": (
+                                    answer_validation.to_dict(
+                                        include_reason=False
                                     )
                                 ),
-                                error=answer_validation.error,
-                                diagnostic=diagnostic,
-                            )
-                            failure_diagnostics.append(
-                                {
-                                    "round_index": _round_index,
-                                    "history": [
-                                        action.to_dict()
-                                        for action in node.session.history
-                                    ],
-                                    "candidate_actions": [
-                                        action.to_dict() for action in chunk
-                                    ],
-                                    "answer_validation": (
-                                        answer_validation.to_dict()
-                                    ),
-                                    "teacher_feedback": (
-                                        verification.planner_feedback()
-                                    ),
-                                    "evidence_count": len(
-                                        child_session.evidence
-                                    ),
-                                    "raw_inspection_calls": (
-                                        child_session.raw_inspection_calls
-                                    ),
-                                }
-                            )
+                                "teacher_feedback": (
+                                    verification.planner_feedback()
+                                ),
+                                "evidence_count": len(
+                                    child_session.evidence
+                                ),
+                                "raw_inspection_calls": (
+                                    child_session.raw_inspection_calls
+                                ),
+                            }
+                        )
                     candidates_evaluated += 1
                     decision = InteractiveDecision(
                         observation=observation,
@@ -2005,7 +2400,7 @@ class InteractiveTeacherSearch:
                                             verification.planner_feedback()
                                         ),
                                         verification_after=verification,
-                                        action_source="verifier_stop",
+                                        action_source="answer_stop",
                                     ),
                                 ],
                                 verification=verification,
@@ -2061,8 +2456,7 @@ class InteractiveTeacherSearch:
             candidates_evaluated=candidates_evaluated,
             planner_calls=getattr(self.planner, "calls", 0)
             - planner_calls_before,
-            verifier_calls=getattr(self.verifier, "calls", 0)
-            - verifier_calls_before,
+            verifier_calls=0,
             answer_validation=selected.answer_validation,
             answer_validator_calls=(
                 getattr(self.answer_validator, "calls", 0)

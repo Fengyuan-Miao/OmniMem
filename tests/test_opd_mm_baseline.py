@@ -24,6 +24,7 @@ from opd_mm_baseline.retrieval import (
     TurnAwareHybridRetriever,
 )
 from opd_mm_baseline.schema import (
+    RETRIEVAL_METHODS,
     TrajectoryValidationError,
     TrajectoryValidator,
 )
@@ -157,6 +158,15 @@ class CapturingRawInspector:
 
 def test_validator_rejects_memory_ids_and_custom_search_queries():
     validator = TrajectoryValidator()
+    assert "vision" in RETRIEVAL_METHODS
+    assert "bm25|dense|vision|hybrid" in validator.schema_text()
+    actions = validator.validate(
+        [
+            {"tool": "RETRIEVE", "method": "vision", "top_k": 3},
+            {"tool": "STOP"},
+        ]
+    )
+    assert actions[0].arguments["method"] == "vision"
     with pytest.raises(TrajectoryValidationError, match="forbidden"):
         validator.validate(
             [
@@ -343,7 +353,7 @@ def test_turn_aware_retrieval_returns_text_and_image_from_same_memory_entry():
     ]
 
 
-def test_question_image_visual_route_ranks_and_expands_matching_turn():
+def test_question_image_vision_route_ranks_and_expands_matching_turn():
     records = [
         MemoryRecord(
             "D1:1:turn",
@@ -378,7 +388,7 @@ def test_question_image_visual_route_ranks_and_expands_matching_turn():
         store.initial_pool(),
         "What is in this picture?",
         store,
-        method="hybrid",
+        method="vision",
         top_k=1,
         question_image="/tmp/support-query.jpg",
     )
