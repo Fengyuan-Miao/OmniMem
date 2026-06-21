@@ -11,7 +11,6 @@ from .clients import (
     OpenAICompatibleClient,
     extract_json_array,
     extract_json_object,
-    extract_policy_action_values,
 )
 from .executor import ToolExecutor
 from .models import (
@@ -1303,12 +1302,9 @@ def build_simple_student_policy_prompt(
 Choose the next executable action.
 Use only the available tools and the current observation.
 Do not answer the user query. Do not assume hidden facts.
-Return only a JSON object with:
-- "reflection": one short student-visible diagnosis of the evidence gap.
-- "action": a JSON array of {action_count}.
-
+Return only a JSON array of {action_count}.
 Do not mention hidden labels, hidden support, private signals, memory IDs, or
-file paths in the reflection.
+file paths.
 
 Available tools:
 {schema}
@@ -1323,7 +1319,7 @@ Current observation:
 {json.dumps(observation.to_prompt_dict(), ensure_ascii=False)}
 
 Final JSON shape:
-{{"reflection":"brief reason for the next tool choice","action":{action_shape}}}
+{action_shape}
 """
 
 
@@ -1468,13 +1464,13 @@ def build_compact_planner_prompt(
         )
     )
     final_shape = (
-        '{"candidates":[{"reflection":"brief gap -> route choice -> next '
-        'step","next_tool":"RETRIEVE","actions":[{"tool":"RETRIEVE",'
+        '{"candidates":[{"next_tool":"RETRIEVE","expected_gain":"find a '
+        'focused candidate pool","actions":[{"tool":"RETRIEVE",'
         '"method":"vision","top_k":5,"scope":"all"}]}]}'
         if atomic
         else (
-            '{"candidates":[{"reflection":"brief gap -> route choice -> '
-            'next step","next_tool":"RETRIEVE","actions":[{"tool":'
+            '{"candidates":[{"next_tool":"RETRIEVE","expected_gain":"find '
+            'and read a focused candidate pool","actions":[{"tool":'
             '"RETRIEVE","method":"vision","top_k":5,"scope":"all"},'
             '{"tool":"READ","fields":["summary","content","ocr",'
             '"timestamp","session_date","turn_id","author","modality",'
@@ -1518,7 +1514,7 @@ Planning guidance:
   different. Depending on the state, this may mean expressing the missing
   concept in a focused query, changing retrieval breadth or method, exploring
   neighboring turns, or inspecting relevant raw images.
-- The reflection and executable actions must agree. If the reflection says a
+- Candidate metadata and executable actions must agree. If next_tool says a
   more targeted search or broader context is needed, the action parameters
   should visibly implement that change.
 - Prefer a deliberate step whose effect can be judged from the next
@@ -1698,7 +1694,6 @@ class ChatInteractivePlanner:
         if isinstance(candidate, dict):
             action_values = candidate.get("actions")
             rationale = {
-                "reflection": _clip_text(candidate.get("reflection"), 360),
                 "next_tool": _clip_text(candidate.get("next_tool"), 80),
                 "expected_gain": _clip_text(
                     candidate.get("expected_gain"),
@@ -1749,7 +1744,7 @@ class ChatInteractivePlanner:
                     "role": "system",
                     "content": (
                         "Think privately if enabled, then output only the "
-                        "final JSON object with keys reflection and action."
+                        "final JSON action array."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -1757,7 +1752,7 @@ class ChatInteractivePlanner:
             **self._completion_kwargs(),
         )
         self.last_raw_response = raw
-        actions = self.validator.repair(extract_policy_action_values(raw))
+        actions = self.validator.repair(extract_json_array(raw))
         signature = _actions_signature(actions)
         self.last_candidate_sources = {signature: "planner"}
         self.last_candidate_rationales = {}
@@ -1841,46 +1836,6 @@ class ChatInteractivePlanner:
         return validated[: max(1, candidate_count)]
 
 
-def _default_reflection_for_actions(actions: List[ToolAction]) -> str:
-    tool = actions[0].tool if actions else "STOP"
-    if tool == "RETRIEVE":
-        return "Current evidence is insufficient, so search for a focused candidate pool."
-    if tool == "READ":
-        return "Candidates are available but evidence is incomplete, so read the memory fields."
-    if tool == "INSPECT_RAW":
-        return "The query depends on visual details, so inspect the retrieved raw images."
-    if tool == "FILTER":
-        return "The candidate pool needs a metadata constraint before reading evidence."
-    if tool == "SORT":
-        return "The candidate pool should be ordered before selecting evidence."
-    if tool == "TOPK":
-        return "The candidate pool should be narrowed to the most relevant entries."
-    if tool == "EXPAND_NEIGHBORS":
-        return "Neighboring turns may provide missing conversational context."
-    if tool == "STOP":
-        return "The available evidence is sufficient for the answer, so stop."
-    return "Choose the next tool that best reduces the current evidence gap."
-
-
-def reflection_action_target(
-    actions: List[ToolAction],
-    reflection: Optional[Dict[str, str]] = None,
-) -> str:
-    text = ""
-    if isinstance(reflection, dict):
-        text = _clip_text(reflection.get("reflection"), 220)
-    if not text:
-        text = _default_reflection_for_actions(actions)
-    return json.dumps(
-        {
-            "reflection": text,
-            "action": [action.to_dict() for action in actions],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
 @dataclass
 class InteractiveDecision:
     observation: InteractiveObservation
@@ -1891,7 +1846,6 @@ class InteractiveDecision:
     verification_after: VerificationResult
     planner_raw_response: str = ""
     action_source: str = "planner"
-    teacher_reflection: Dict[str, str] = field(default_factory=dict)
 
     def sft_example(
         self,
@@ -1923,9 +1877,10 @@ class InteractiveDecision:
         return SFTExample(
             sample_id=f"{sample_id}:step:{step_index}",
             input=student_input,
-            target=reflection_action_target(
-                self.actions,
-                self.teacher_reflection,
+            target=json.dumps(
+                [action.to_dict() for action in self.actions],
+                ensure_ascii=False,
+                separators=(",", ":"),
             ),
             round_index=step_index,
             metadata={
@@ -1940,7 +1895,6 @@ class InteractiveDecision:
                         self.privileged_feedback
                     ),
                     "action_source": self.action_source,
-                    "teacher_reflection": self.teacher_reflection,
                 },
             },
         )
@@ -2365,10 +2319,6 @@ class InteractiveTeacherSearch:
                         action_source=candidate_sources.get(
                             _actions_signature(chunk),
                             "controller_fallback",
-                        ),
-                        teacher_reflection=candidate_rationales.get(
-                            _actions_signature(chunk),
-                            {},
                         ),
                     )
                     child = SearchNode(

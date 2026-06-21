@@ -316,10 +316,6 @@ class OnlineSelfDistiller:
             decision_sources = [
                 decision.action_source for decision in teacher_result.decisions
             ]
-            decision_reflections = [
-                decision.teacher_reflection
-                for decision in teacher_result.decisions
-            ]
             trainable_path = _is_trainable_teacher_path(
                 teacher_result.decisions
             )
@@ -330,7 +326,6 @@ class OnlineSelfDistiller:
                         action.to_dict() for action in teacher_result.actions
                     ],
                     "selected_action_sources": decision_sources,
-                    "selected_reflections": decision_reflections,
                     "selected_first_action_source": (
                         decision_sources[0] if decision_sources else None
                     ),

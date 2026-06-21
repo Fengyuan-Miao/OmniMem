@@ -101,23 +101,6 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("unterminated JSON object")
 
 
-def extract_policy_action_values(text: str) -> List[Dict[str, Any]]:
-    """Extract executable actions from either old or reflection-style output."""
-    try:
-        return extract_json_array(text)
-    except Exception:
-        pass
-    value = extract_json_object(text)
-    if "tool" in value:
-        return [value]
-    actions = value.get("action")
-    if actions is None:
-        actions = value.get("actions")
-    if not isinstance(actions, list):
-        raise ValueError("policy output has no action/actions list")
-    return actions
-
-
 def image_data_url(path: str | Path) -> str:
     source = Path(path)
     mime = mimetypes.guess_type(source.name)[0] or "image/jpeg"

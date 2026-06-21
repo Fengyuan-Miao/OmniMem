@@ -44,12 +44,11 @@ from dual_encoder_memory import MiniLMTextEncoder, SigLIPVisionEncoder
 from omnimem.config import require_memgallery_dir
 
 from .build_opd_dataset import split_name
-from .clients import extract_policy_action_values
+from .clients import extract_json_array
 from .interactive import (
     ChatInteractivePlanner,
     InteractiveActionValidator,
     build_simple_student_policy_prompt,
-    reflection_action_target,
 )
 from .memgallery import build_scenario_store, scenario_samples
 from .memgallery_online_pipeline import make_components
@@ -222,7 +221,7 @@ class LocalStudentPlanner(ChatInteractivePlanner):
         )
         raw = self.generator.generate(prompt)
         self.last_raw_response = raw
-        values = extract_policy_action_values(raw)
+        values = extract_json_array(raw)
         normalized = []
         for value in values:
             if not isinstance(value, dict):
@@ -325,8 +324,8 @@ def render_policy_prompt(
             "at deployment.\n\n"
             f"{privileged_context.strip()}\n\n"
             "Now produce your own next action for the original state. "
-            "Return only the final JSON object with a short reflection and "
-            "an action array containing exactly one executable tool action."
+            "Return only the final JSON array containing exactly one "
+            "executable tool action."
         )
     else:
         user_content = prompt
@@ -335,7 +334,7 @@ def render_policy_prompt(
             "role": "system",
             "content": (
                 "Think privately if enabled. Supervise only the final answer: "
-                "a JSON object with keys reflection and action."
+                "a JSON array of executable tool actions."
             ),
         },
         {"role": "user", "content": user_content},
@@ -353,22 +352,14 @@ def render_policy_prompt(
     )["input_ids"]
 
 
-def _teacher_reflection(correction: OnlineCorrection) -> Dict[str, str]:
-    metadata = correction.example.metadata or {}
-    opd_metadata = metadata.get("opd") or {}
-    reflection = opd_metadata.get("teacher_reflection")
-    if isinstance(reflection, dict):
-        return {str(key): str(value) for key, value in reflection.items()}
-    return {}
-
-
 def _teacher_completion(correction: OnlineCorrection) -> Optional[str]:
     actions = [action.to_dict() for action in correction.teacher_actions]
     if len(actions) != 1:
         return None
-    return reflection_action_target(
-        correction.teacher_actions,
-        _teacher_reflection(correction),
+    return json.dumps(
+        actions,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
@@ -388,15 +379,6 @@ def _privileged_context(
     decision_index = int(
         correction.example.metadata.get("teacher_decision_index", 0)
     )
-    reflection = ""
-    reflections = attempt.get("selected_reflections") or []
-    if (
-        0 <= decision_index < len(reflections)
-        and isinstance(reflections[decision_index], dict)
-    ):
-        reflection = str(
-            reflections[decision_index].get("reflection") or ""
-        ).strip()
     payload: Dict[str, Any] = {
         "validated_outcome": (
             "This decision belongs to a trajectory that produced a correct "
@@ -404,8 +386,6 @@ def _privileged_context(
         ),
         "trajectory_step": decision_index,
     }
-    if reflection:
-        payload["teacher_diagnosis"] = reflection
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 

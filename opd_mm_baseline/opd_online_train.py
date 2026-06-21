@@ -548,7 +548,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=False,
         help=(
             "Ablation only: include thinking tokens in the supervised prompt. "
-            "Default false keeps loss on the final reflection/action object."
+            "Default false keeps loss on the final action JSON array."
         ),
     )
     parser.add_argument("--max-prompt-length", type=int, default=1792)

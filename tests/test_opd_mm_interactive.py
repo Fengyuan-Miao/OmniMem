@@ -377,9 +377,8 @@ def test_simple_student_prompt_only_describes_tools_and_online_state() -> None:
     assert "Available tools:" in prompt
     assert "RETRIEVE(" in prompt
     assert "INSPECT_RAW(" in prompt
-    assert "Return only a JSON object" in prompt
-    assert '"reflection"' in prompt
-    assert '"action"' in prompt
+    assert "Return only a JSON array" in prompt
+    assert '"reflection"' not in prompt
     assert "teacher" not in prompt.lower()
     assert "gold answer" not in prompt.lower()
     assert "feedback" not in prompt.lower()
@@ -561,9 +560,7 @@ class CapturingInspectRawClient(CapturingClient):
         self.prompt = "\n".join(str(message["content"]) for message in messages)
         self.extra_body = extra_body
         return (
-            '{"candidates":[{"reflection":"visual evidence not inspected, '
-            'inspect current candidates",'
-            '"next_tool":"INSPECT_RAW",'
+            '{"candidates":[{"next_tool":"INSPECT_RAW",'
             '"expected_gain":"raw visual details",'
             '"actions":[{"tool":"INSPECT_RAW",'
             '"target":"current_pool",'
@@ -618,7 +615,7 @@ def test_chat_planner_passes_thinking_token_budget() -> None:
     assert client.extra_body == {"thinking_token_budget": 128}
 
 
-def test_chat_planner_student_simple_uses_reflection_action_prompt() -> None:
+def test_chat_planner_student_simple_uses_action_array_prompt() -> None:
     client = CapturingClient(
         '[{"tool":"RETRIEVE","method":"bm25","top_k":1,"scope":"all"}]'
     )
@@ -639,9 +636,8 @@ def test_chat_planner_student_simple_uses_reflection_action_prompt() -> None:
         observation=session.observation(),
     )
     assert candidates[0][0].tool == "RETRIEVE"
-    assert "final JSON object with keys reflection and action" in client.prompt
-    assert '"reflection"' in client.prompt
-    assert '"action"' in client.prompt
+    assert "final JSON action array" in client.prompt
+    assert '"reflection"' not in client.prompt
     assert "Return a memory-tool policy JSON" not in client.prompt
     assert "candidates" not in client.prompt
 
@@ -704,7 +700,7 @@ def test_chat_planner_softly_prompts_visual_feedback_without_injection() -> None
     )
     assert candidates[0][0].tool == "INSPECT_RAW"
     assert "final JSON object" in client.prompt
-    assert "brief gap -> route choice -> next step" in client.prompt
+    assert "expected_gain" in client.prompt
     assert "visual/image gap" in client.prompt
     assert "Use INSPECT_RAW on candidates." in client.prompt
     signature = json.dumps(
@@ -716,8 +712,8 @@ def test_chat_planner_softly_prompts_visual_feedback_without_injection() -> None
     assert planner.last_candidate_rationales[signature]["next_tool"] == (
         "INSPECT_RAW"
     )
-    assert "visual evidence" in (
-        planner.last_candidate_rationales[signature]["reflection"]
+    assert planner.last_candidate_rationales[signature]["expected_gain"] == (
+        "raw visual details"
     )
 
 

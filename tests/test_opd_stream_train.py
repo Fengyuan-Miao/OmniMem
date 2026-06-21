@@ -34,9 +34,8 @@ from opd_mm_baseline.opd_stream_train import (
 
 def _completion_actions(completion: str):
     value = json.loads(completion)
-    if isinstance(value, list):
-        return value
-    return value["action"]
+    assert isinstance(value, list)
+    return value
 
 
 def test_deepspeed_plugin_is_optional_and_configures_zero2() -> None:
@@ -99,14 +98,7 @@ def _result(student_raw_response: str) -> OnlineSampleResult:
         ),
         corrections=[correction],
         student_planner_calls=1,
-        teacher_attempts=[
-            {
-                "state_index": 0,
-                "selected_reflections": [
-                    {"reflection": "text evidence is incomplete"}
-                ],
-            }
-        ],
+        teacher_attempts=[{"state_index": 0}],
     )
 
 
@@ -117,9 +109,8 @@ def test_streaming_example_uses_validated_teacher_action_as_completion() -> None
         quality_filter="teacher-correct",
     )
     assert len(examples) == 1
-    completion = json.loads(examples[0].completion)
-    assert completion["reflection"]
-    assert completion["action"] == [
+    completion = _completion_actions(examples[0].completion)
+    assert completion == [
         {"tool": "RETRIEVE", "method": "hybrid", "top_k": 5}
     ]
     assert examples[0].teacher_prompt == "privileged teacher prompt"
@@ -165,10 +156,6 @@ def test_streaming_examples_keep_every_validated_teacher_decision() -> None:
             student_raw_response=first.student_raw_response,
         )
     )
-    result.teacher_attempts[0]["selected_reflections"].append(
-        {"reflection": "retrieved candidates still need to be read"}
-    )
-
     examples = streaming_examples_from_result(
         result,
         quality_filter="teacher-correct",
@@ -180,9 +167,7 @@ def test_streaming_examples_keep_every_validated_teacher_decision() -> None:
         {"tool": "READ", "fields": ["summary"]}
     ]
     privileged = json.loads(examples[1].privileged_context)
-    assert privileged["teacher_diagnosis"].startswith(
-        "retrieved candidates"
-    )
+    assert "teacher_diagnosis" not in privileged
 
 
 def test_streaming_examples_skip_multi_action_teacher_targets() -> None:
@@ -353,20 +338,17 @@ def test_local_student_planner_normalizes_action_arguments_shape() -> None:
     assert actions[0].arguments["method"] == "bm25"
 
 
-def test_local_student_planner_accepts_reflection_action_object() -> None:
+def test_local_student_planner_accepts_json_action_array() -> None:
     class Generator:
         @staticmethod
         def generate(_prompt: str) -> str:
             return json.dumps(
-                {
-                    "reflection": "Candidates exist but no evidence was read.",
-                    "action": [
-                        {
-                            "tool": "READ",
-                            "fields": ["summary"],
-                        }
-                    ],
-                }
+                [
+                    {
+                        "tool": "READ",
+                        "fields": ["summary"],
+                    }
+                ]
             )
 
     validator = InteractiveActionValidator()
