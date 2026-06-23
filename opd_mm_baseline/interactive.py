@@ -886,7 +886,7 @@ class AnswerValidationResult:
     reason: str = ""
     error: str = ""
     image_ids_match: Optional[bool] = None
-    diagnostic: Dict[str, str] = field(default_factory=dict)
+    diagnostic: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_reason: bool = True) -> Dict[str, Any]:
         data = {
@@ -919,12 +919,23 @@ class AnswerValidationResult:
             recommended_change = (
                 "Retrieve a focused candidate pool, then READ relevant fields."
             )
+            action_hints: Dict[str, Any] = {
+                "recommended_tool": "READ_OR_RETRIEVE",
+                "needs_text_evidence": True,
+                "needs_visual_evidence": False,
+                "avoid_action": "STOP",
+            }
         elif self.error:
             failure_type = "answer_validation_error"
             evidence_gap = "The answer validation call failed."
             recommended_change = (
                 "Continue with a different evidence path and validate again."
             )
+            action_hints = {
+                "recommended_tool": "RETRIEVE",
+                "recommended_retrieval_method": "hybrid",
+                "avoid_action": "STOP",
+            }
         elif self.image_ids_match is False:
             failure_type = "image_id_mismatch"
             evidence_gap = (
@@ -936,6 +947,14 @@ class AnswerValidationResult:
                 if can_inspect_raw
                 else "Refine retrieval to isolate the relevant visual memories."
             )
+            action_hints = {
+                "recommended_tool": (
+                    "INSPECT_RAW" if can_inspect_raw else "RETRIEVE"
+                ),
+                "recommended_retrieval_method": "vision",
+                "needs_visual_evidence": True,
+                "avoid_action": "STOP",
+            }
         elif self.diagnostic:
             failure_type = self.diagnostic.get(
                 "failure_type",
@@ -950,6 +969,20 @@ class AnswerValidationResult:
                 "Change the retrieval query or candidate pool, then read the "
                 "new evidence.",
             )
+            action_hints = {
+                key: value
+                for key, value in self.diagnostic.items()
+                if key
+                in {
+                    "recommended_tool",
+                    "recommended_retrieval_method",
+                    "recommended_query_focus",
+                    "needs_text_evidence",
+                    "needs_visual_evidence",
+                    "needs_neighbor_context",
+                    "avoid_action",
+                }
+            }
         elif has_raw_inspection:
             failure_type = "answer_mismatch_after_raw_inspection"
             evidence_gap = (
@@ -960,6 +993,11 @@ class AnswerValidationResult:
                 "Change the retrieval query or candidate pool instead of "
                 "re-inspecting the same evidence."
             )
+            action_hints = {
+                "recommended_tool": "RETRIEVE",
+                "recommended_retrieval_method": "hybrid",
+                "avoid_action": "INSPECT_RAW",
+            }
         else:
             failure_type = "answer_mismatch"
             evidence_gap = (
@@ -970,6 +1008,12 @@ class AnswerValidationResult:
                 "Reformulate retrieval, change retrieval method, or expand "
                 "neighboring turns before reading again."
             )
+            action_hints = {
+                "recommended_tool": "RETRIEVE",
+                "recommended_retrieval_method": "hybrid",
+                "needs_text_evidence": True,
+                "avoid_action": "STOP",
+            }
 
         diagnostic = {
             "failure_type": failure_type,
@@ -978,6 +1022,7 @@ class AnswerValidationResult:
             "image_ids_match": self.image_ids_match,
             "evidence_gap": evidence_gap,
             "recommended_change": recommended_change,
+            **action_hints,
         }
         return {
             key: value
@@ -1041,6 +1086,7 @@ class StrictAnswerValidator:
                 prediction="",
                 reason="No retrieved evidence was provided.",
             )
+        assessment_error = ""
         try:
             assess_evidence = getattr(
                 self.answer_model,
@@ -1048,58 +1094,71 @@ class StrictAnswerValidator:
                 None,
             )
             if callable(assess_evidence):
-                data = assess_evidence(
-                    query,
-                    gold_answer,
-                    evidence,
-                    question_image=question_image,
-                )
-                answerable = bool(data.get("answerable"))
                 try:
-                    score = float(
-                        data.get(
-                            "score",
-                            1.0 if answerable else 0.0,
-                        )
+                    data = assess_evidence(
+                        query,
+                        gold_answer,
+                        evidence,
+                        question_image=question_image,
                     )
-                except (TypeError, ValueError):
-                    score = 1.0 if answerable else 0.0
-                score = max(0.0, min(1.0, score))
-                prediction = str(
-                    data.get("predicted_answer")
-                    or data.get("answer")
-                    or ""
-                )
-                reason = str(data.get("reason") or "")
-                gold_ids = set(PUBLIC_IMAGE_ID_PATTERN.findall(gold_answer))
-                predicted_ids = set(
-                    PUBLIC_IMAGE_ID_PATTERN.findall(prediction)
-                )
-                image_ids_match = (
-                    predicted_ids == gold_ids if gold_ids else None
-                )
-                correct = (
-                    answerable
-                    and score >= self.min_score
-                    and image_ids_match is not False
-                )
-                diagnostic = {
-                    key: str(data.get(key) or "")
+                except Exception as exc:
+                    assessment_error = str(exc)
+                else:
+                    answerable = bool(data.get("answerable"))
+                    try:
+                        score = float(
+                            data.get(
+                                "score",
+                                1.0 if answerable else 0.0,
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        score = 1.0 if answerable else 0.0
+                    score = max(0.0, min(1.0, score))
+                    prediction = str(
+                        data.get("predicted_answer")
+                        or data.get("answer")
+                        or ""
+                    )
+                    reason = str(data.get("reason") or "")
+                    gold_ids = set(
+                        PUBLIC_IMAGE_ID_PATTERN.findall(gold_answer)
+                    )
+                    predicted_ids = set(
+                        PUBLIC_IMAGE_ID_PATTERN.findall(prediction)
+                    )
+                    image_ids_match = (
+                        predicted_ids == gold_ids if gold_ids else None
+                    )
+                    correct = (
+                        answerable
+                        and score >= self.min_score
+                        and image_ids_match is not False
+                    )
+                    diagnostic = {}
                     for key in (
                         "failure_type",
                         "evidence_gap",
                         "recommended_change",
+                        "recommended_tool",
+                        "recommended_retrieval_method",
+                        "recommended_query_focus",
+                        "needs_text_evidence",
+                        "needs_visual_evidence",
+                        "needs_neighbor_context",
+                        "avoid_action",
+                    ):
+                        value = data.get(key)
+                        if value is not None and value != "" and value != []:
+                            diagnostic[key] = value
+                    return AnswerValidationResult(
+                        correct=correct,
+                        score=score,
+                        prediction=prediction,
+                        reason=reason,
+                        image_ids_match=image_ids_match,
+                        diagnostic=diagnostic,
                     )
-                    if data.get(key)
-                }
-                return AnswerValidationResult(
-                    correct=correct,
-                    score=score,
-                    prediction=prediction,
-                    reason=reason,
-                    image_ids_match=image_ids_match,
-                    diagnostic=diagnostic,
-                )
 
             prediction = self.answer_model.answer(
                 query,
@@ -1139,11 +1198,30 @@ class StrictAnswerValidator:
                     )
                 except Exception:
                     diagnostic = {}
+            if not correct and not diagnostic and assessment_error:
+                diagnostic = {
+                    "failure_type": "assessment_parse_error",
+                    "evidence_gap": (
+                        "The structured evidence assessor failed to return "
+                        "valid JSON, and the fallback answer path did not "
+                        "identify a specific evidence gap."
+                    ),
+                    "recommended_change": (
+                        "Try a different evidence path, then validate again."
+                    ),
+                    "recommended_tool": "RETRIEVE",
+                    "recommended_retrieval_method": "hybrid",
+                    "avoid_action": "STOP",
+                }
             return AnswerValidationResult(
                 correct=correct,
                 score=score,
                 prediction=prediction,
-                reason=str(reason or ""),
+                reason=str(reason or "") or (
+                    "Used answer+judge fallback after assessment JSON error."
+                    if assessment_error
+                    else ""
+                ),
                 image_ids_match=image_ids_match,
                 diagnostic=diagnostic,
             )
@@ -1379,13 +1457,24 @@ def _compact_feedback(feedback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     diagnostic = feedback.get("failure_diagnostic")
     if isinstance(diagnostic, dict):
         compact["failure_diagnostic"] = {
-            key: _clip_text(diagnostic.get(key), 180)
+            key: (
+                diagnostic.get(key)
+                if isinstance(diagnostic.get(key), bool)
+                else _clip_text(diagnostic.get(key), 180)
+            )
             for key in (
                 "failure_type",
                 "evidence_gap",
                 "recommended_change",
+                "recommended_tool",
+                "recommended_retrieval_method",
+                "recommended_query_focus",
+                "needs_text_evidence",
+                "needs_visual_evidence",
+                "needs_neighbor_context",
+                "avoid_action",
             )
-            if diagnostic.get(key)
+            if diagnostic.get(key) not in {"", None}
         }
     return compact
 
@@ -1459,17 +1548,20 @@ def build_compact_planner_prompt(
         if atomic
         else (
             "- RETRIEVE alone cannot support an answer. Usually follow a "
-            "useful retrieval with READ in the same chunk, or INSPECT_RAW "
-            "when raw visual comparison is needed."
+            "useful retrieval with READ in the same chunk. If the missing "
+            "evidence is visual, use INSPECT_RAW; if the missing evidence "
+            "may be in nearby dialogue turns, use EXPAND_NEIGHBORS then READ."
         )
     )
     final_shape = (
-        '{"candidates":[{"next_tool":"RETRIEVE","expected_gain":"find a '
-        'focused candidate pool","actions":[{"tool":"RETRIEVE",'
-        '"method":"vision","top_k":5,"scope":"all"}]}]}'
+        '{"candidates":[{"diagnosis":"why this is the right next step",'
+        '"next_tool":"RETRIEVE","expected_gain":"find a focused candidate '
+        'pool","actions":[{"tool":"RETRIEVE","method":"vision","top_k":5,'
+        '"scope":"all"}]}]}'
         if atomic
         else (
-            '{"candidates":[{"next_tool":"RETRIEVE","expected_gain":"find '
+            '{"candidates":[{"diagnosis":"why this chunk addresses the '
+            'current feedback","next_tool":"RETRIEVE","expected_gain":"find '
             'and read a focused candidate pool","actions":[{"tool":'
             '"RETRIEVE","method":"vision","top_k":5,"scope":"all"},'
             '{"tool":"READ","fields":["summary","content","ocr",'
@@ -1503,6 +1595,29 @@ Constraints:
 - Do not STOP while relevant candidates remain unread or uninspected.
 - No memory IDs or file paths.
 - If fb says visual/image gap, use INSPECT_RAW.
+- If fb says text/context/date/person relation is missing after a READ,
+  consider EXPAND_NEIGHBORS, FILTER, SORT, or a different retrieval route
+  instead of another similar RETRIEVE.
+
+Answer-model feedback:
+- fb is a privileged assessment of whether the current evidence can support an
+  answer. Use it as the main diagnosis, but do not copy hidden answer content.
+- If fb.continue_required is true, do not STOP. Choose the next action that
+  most directly addresses fb.failure_diagnostic.evidence_gap.
+- If fb.failure_diagnostic has recommended_tool, make at least one candidate
+  follow that tool unless the observation makes it impossible.
+- If recommended_tool is READ, read the current candidate pool instead of
+  retrieving again. If it is INSPECT_RAW, inspect current visual candidates. If
+  it is RETRIEVE, change the retrieval method, query focus, scope, or top_k so
+  the attempt is not a repeat of last_retrieval. If it is EXPAND_NEIGHBORS,
+  recover surrounding turns before reading. If it names STOP, stop only when
+  fb says the evidence is answerable.
+- Respect avoid_action as a warning about a repeated or unhelpful move.
+- Treat repeated failure as a signal to switch tools. For example, after a
+  failed semantic search try bm25/vision/hybrid with a focused query; after
+  reading a plausible memory but missing chronology, expand neighbors or sort
+  by time; after seeing image candidates but lacking visual confirmation,
+  inspect raw images.
 
 Planning guidance:
 - evidence.new is the evidence added by the most recent action chunk.
@@ -1514,9 +1629,16 @@ Planning guidance:
   different. Depending on the state, this may mean expressing the missing
   concept in a focused query, changing retrieval breadth or method, exploring
   neighboring turns, or inspecting relevant raw images.
+- In chunk mode, prefer a compact repair plan over a single habitual action:
+  retrieve+read for a new pool, expand+read for surrounding context,
+  filter/sort+read for narrowing or temporal questions, inspect_raw for
+  visual verification. Keep the chunk short and purposeful.
 - Candidate metadata and executable actions must agree. If next_tool says a
   more targeted search or broader context is needed, the action parameters
   should visibly implement that change.
+- Each candidate should include a short diagnosis explaining which feedback
+  gap it addresses. Prefer candidates with different tools or retrieval
+  methods when multiple plausible repairs exist.
 - Prefer a deliberate step whose effect can be judged from the next
   observation.
 
@@ -1694,6 +1816,7 @@ class ChatInteractivePlanner:
         if isinstance(candidate, dict):
             action_values = candidate.get("actions")
             rationale = {
+                "diagnosis": _clip_text(candidate.get("diagnosis"), 240),
                 "next_tool": _clip_text(candidate.get("next_tool"), 80),
                 "expected_gain": _clip_text(
                     candidate.get("expected_gain"),
@@ -1716,12 +1839,17 @@ class ChatInteractivePlanner:
             "temperature": 0.0,
         }
         extra_body: Dict[str, Any] = {}
-        if self.thinking_token_budget is not None:
+        if (
+            self.thinking_token_budget is not None
+            and self.enable_thinking is not False
+        ):
             extra_body["thinking_token_budget"] = self.thinking_token_budget
         if self.enable_thinking is not None:
             extra_body["chat_template_kwargs"] = {
                 "enable_thinking": bool(self.enable_thinking)
             }
+            if self.enable_thinking is False:
+                completion_kwargs["prefill_assistant"] = "</think>\n\n"
         if extra_body:
             completion_kwargs["extra_body"] = extra_body
         return completion_kwargs
@@ -1846,6 +1974,7 @@ class InteractiveDecision:
     verification_after: VerificationResult
     planner_raw_response: str = ""
     action_source: str = "planner"
+    planner_rationale: Dict[str, str] = field(default_factory=dict)
 
     def sft_example(
         self,
@@ -1895,6 +2024,7 @@ class InteractiveDecision:
                         self.privileged_feedback
                     ),
                     "action_source": self.action_source,
+                    "teacher_rationale": dict(self.planner_rationale),
                 },
             },
         )
@@ -1909,17 +2039,33 @@ class SearchNode:
     )
     answer_validation: Optional[AnswerValidationResult] = None
 
-    def score(self) -> tuple[Any, ...]:
+    def score(
+        self,
+        *,
+        action_cost: float = 0.0,
+        evidence_cost: float = 0.0,
+    ) -> tuple[Any, ...]:
         raw_evidence = sum(
             1 for item in self.session.evidence if item.source == "INSPECT_RAW"
         )
         no_op_reads = self._redundant_read_count()
+        answer_score = (
+            float(self.answer_validation.score)
+            if self.answer_validation is not None
+            else 0.0
+        )
+        path_cost = (
+            float(action_cost) * len(self.session.history)
+            + float(evidence_cost) * len(self.session.evidence)
+        )
         return (
             int(
                 self.answer_validation is not None
                 and self.answer_validation.correct
             ),
             int(self.verification.answerable),
+            answer_score,
+            -path_cost,
             self.verification.completeness,
             self.verification.relevance,
             -self.verification.redundancy,
@@ -2082,6 +2228,8 @@ class InteractiveTeacherSearch:
         max_evidence: int = 40,
         max_raw_inspections: int = 3,
         answer_validator: Optional[StrictAnswerValidator] = None,
+        trajectory_action_cost: float = 0.0,
+        trajectory_evidence_cost: float = 0.0,
     ):
         self.planner = planner
         self.verifier = verifier
@@ -2095,6 +2243,8 @@ class InteractiveTeacherSearch:
         self.max_evidence = max(1, int(max_evidence))
         self.max_raw_inspections = max(0, int(max_raw_inspections))
         self.answer_validator = answer_validator
+        self.trajectory_action_cost = max(0.0, float(trajectory_action_cost))
+        self.trajectory_evidence_cost = max(0.0, float(trajectory_evidence_cost))
 
     @staticmethod
     def _evidence_redundancy(evidence: List[EvidenceItem]) -> float:
@@ -2320,6 +2470,10 @@ class InteractiveTeacherSearch:
                             _actions_signature(chunk),
                             "controller_fallback",
                         ),
+                        planner_rationale=candidate_rationales.get(
+                            _actions_signature(chunk),
+                            {},
+                        ),
                     )
                     child = SearchNode(
                         session=child_session,
@@ -2351,6 +2505,13 @@ class InteractiveTeacherSearch:
                                         ),
                                         verification_after=verification,
                                         action_source="answer_stop",
+                                        planner_rationale={
+                                            "diagnosis": (
+                                                "answer model judged current "
+                                                "evidence sufficient"
+                                            ),
+                                            "next_tool": "STOP",
+                                        },
                                     ),
                                 ],
                                 verification=verification,
@@ -2369,18 +2530,33 @@ class InteractiveTeacherSearch:
                     ensure_ascii=False,
                 )
                 previous = deduped.get(signature)
-                if previous is None or child.score() > previous.score():
+                if previous is None or child.score(
+                    action_cost=self.trajectory_action_cost,
+                    evidence_cost=self.trajectory_evidence_cost,
+                ) > previous.score(
+                    action_cost=self.trajectory_action_cost,
+                    evidence_cost=self.trajectory_evidence_cost,
+                ):
                     deduped[signature] = child
             beam = sorted(
                 deduped.values(),
-                key=lambda node: node.score(),
+                key=lambda node: node.score(
+                    action_cost=self.trajectory_action_cost,
+                    evidence_cost=self.trajectory_evidence_cost,
+                ),
                 reverse=True,
             )[: self.beam_size]
 
         pool = [*finished, *beam]
         if not pool:
             pool = [SearchNode(session=initial)]
-        selected = max(pool, key=lambda node: node.score())
+        selected = max(
+            pool,
+            key=lambda node: node.score(
+                action_cost=self.trajectory_action_cost,
+                evidence_cost=self.trajectory_evidence_cost,
+            ),
+        )
         if not selected.session.stopped:
             observation_before_stop = selected.session.observation()
             history_before_stop = list(selected.session.history)
@@ -2396,6 +2572,10 @@ class InteractiveTeacherSearch:
                     privileged_feedback=selected.verification.planner_feedback(),
                     verification_after=selected.verification,
                     action_source="budget_stop",
+                    planner_rationale={
+                        "diagnosis": "search budget ended before a better action",
+                        "next_tool": "STOP",
+                    },
                 )
             )
         return InteractiveSearchResult(

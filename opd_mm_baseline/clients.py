@@ -98,7 +98,52 @@ def extract_json_object(text: str) -> Dict[str, Any]:
                 if not isinstance(value, dict):
                     raise ValueError("response is not a JSON object")
                 return value
+    repaired = _repair_truncated_json_object(cleaned[start:])
+    if repaired is not None:
+        return repaired
     raise ValueError("unterminated JSON object")
+
+
+def _repair_truncated_json_object(fragment: str) -> Optional[Dict[str, Any]]:
+    """Best-effort repair for model outputs cut off near the end of JSON."""
+    text = str(fragment or "").strip()
+    if not text.startswith("{"):
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+
+    if depth <= 0:
+        return None
+    candidate = text
+    if escaped:
+        candidate = candidate[:-1]
+    if in_string:
+        candidate += '"'
+    candidate = re.sub(r",\s*$", "", candidate)
+    candidate += "}" * depth
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def image_data_url(path: str | Path) -> str:
@@ -254,13 +299,22 @@ class OpenAICompatibleClient:
         max_tokens: int = 512,
         temperature: float = 0.0,
         extra_body: Optional[Dict[str, Any]] = None,
+        prefill_assistant: str = "",
     ) -> str:
+        request_messages = list(messages)
+        if prefill_assistant:
+            request_messages.append(
+                {"role": "assistant", "content": str(prefill_assistant)}
+            )
         body: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": request_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if prefill_assistant:
+            body["add_generation_prompt"] = False
+            body["continue_final_message"] = True
         if extra_body:
             body.update(extra_body)
         payload = json.dumps(
@@ -674,10 +728,14 @@ class ChatAnswerModel:
         client: OpenAICompatibleClient,
         max_tokens: int = 128,
         max_images: int = 3,
+        assessment_retries: int = 1,
     ):
         self.client = client
         self.max_tokens = max_tokens
         self.max_images = max(0, int(max_images))
+        self.assessment_retries = max(0, int(assessment_retries))
+        self.last_assessment_raw = ""
+        self.last_assessment_repair_error = ""
 
     def _prepare_evidence(
         self,
@@ -807,7 +865,10 @@ absence claims, the evidence must cover the relevant subject well enough to
 justify that the requested fact is absent.
 
 If the evidence is insufficient, explain the missing information and recommend
-the next retrieval or inspection step. Do not invent evidence.
+the next retrieval or inspection step. Do not invent evidence. Do not reveal,
+quote, paraphrase, or name the gold answer itself in any failure field. The
+recommendation should tell a planner how to change the evidence state, not what
+the final answer is.
 
 Return only JSON:
 {{
@@ -817,6 +878,13 @@ Return only JSON:
   "failure_type": "",
   "evidence_gap": "",
   "recommended_change": "",
+  "recommended_tool": "RETRIEVE|READ|INSPECT_RAW|EXPAND_NEIGHBORS|FILTER|SORT|TOPK|STOP",
+  "recommended_retrieval_method": "bm25|dense|vision|hybrid",
+  "recommended_query_focus": "short non-gold search focus, if retrieval should change",
+  "needs_text_evidence": false,
+  "needs_visual_evidence": false,
+  "needs_neighbor_context": false,
+  "avoid_action": "short description of a repeated or unhelpful action",
   "reason": "short explanation"
 }}
 
@@ -839,7 +907,41 @@ Retrieved evidence:
             max_tokens=max(self.max_tokens, 192),
             temperature=0.0,
         )
-        return extract_json_object(raw)
+        self.last_assessment_raw = raw
+        self.last_assessment_repair_error = ""
+        try:
+            return extract_json_object(raw)
+        except Exception as first_error:
+            self.last_assessment_repair_error = str(first_error)
+
+        for _attempt in range(self.assessment_retries):
+            repair_prompt = f"""Your previous response was not valid JSON.
+Convert it into one valid JSON object using exactly the assessment schema.
+If a field is unknown, use an empty string, false, or 0.0. Output JSON only.
+
+Previous response:
+{raw}
+"""
+            retry_messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": repair_prompt},
+            ]
+            raw = self.client.complete(
+                retry_messages,
+                max_tokens=max(self.max_tokens, 256),
+                temperature=0.0,
+            )
+            self.last_assessment_raw = raw
+            try:
+                self.last_assessment_repair_error = ""
+                return extract_json_object(raw)
+            except Exception as exc:
+                self.last_assessment_repair_error = str(exc)
+        raise ValueError(
+            "answer evidence assessment returned invalid JSON: "
+            + self.last_assessment_repair_error
+        )
 
 
 class ChatAnswerJudge:

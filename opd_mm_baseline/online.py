@@ -265,6 +265,8 @@ class OnlineSelfDistiller:
         buffer: Optional[OnlineDistillationBuffer] = None,
         raw_inspector: Optional[Any] = None,
         max_raw_inspections: int = 3,
+        teacher_trigger: str = "failure",
+        stop_when_student_evidence_sufficient: bool = False,
     ):
         self.student_planner = student_planner
         self.teacher_search = teacher_search
@@ -277,9 +279,133 @@ class OnlineSelfDistiller:
         self.max_student_actions = max(1, int(max_student_actions))
         self.raw_inspector = raw_inspector
         self.max_raw_inspections = max(0, int(max_raw_inspections))
+        self.stop_when_student_evidence_sufficient = bool(
+            stop_when_student_evidence_sufficient
+        )
+        if teacher_trigger not in {"failure", "always"}:
+            raise ValueError(f"invalid teacher_trigger: {teacher_trigger}")
+        self.teacher_trigger = teacher_trigger
         self.buffer = (
             buffer if buffer is not None else OnlineDistillationBuffer()
         )
+
+    def _append_teacher_corrections(
+        self,
+        *,
+        sample: OPDSample,
+        question_image: Optional[str],
+        session: ExecutorSession,
+        state_index: int,
+        round_index: int,
+        student_actions: List[ToolAction],
+        student_raw_response: str,
+        corrections: List[OnlineCorrection],
+        teacher_attempts: List[Dict[str, Any]],
+    ) -> None:
+        teacher_result = self.teacher_search.search(
+            query=sample.query,
+            gold_answer=sample.gold_answer,
+            memory_store=sample.memory_store,
+            question_image=question_image,
+            initial_session=session,
+        )
+        decision_sources = [
+            decision.action_source for decision in teacher_result.decisions
+        ]
+        decision_reflections = [
+            dict(decision.planner_rationale)
+            for decision in teacher_result.decisions
+        ]
+        trainable_path = _is_trainable_teacher_path(
+            teacher_result.decisions
+        )
+        selected_evidence = getattr(
+            getattr(teacher_result, "execution", None),
+            "evidence",
+            [],
+        )
+        teacher_attempts.append(
+            {
+                "state_index": state_index,
+                "trigger": self.teacher_trigger,
+                "student_actions_before_correction": [
+                    action.to_dict() for action in student_actions
+                ],
+                "selected_actions": [
+                    action.to_dict() for action in teacher_result.actions
+                ],
+                "selected_action_count": len(teacher_result.actions),
+                "selected_evidence_count": len(selected_evidence),
+                "selected_action_sources": decision_sources,
+                "selected_reflections": decision_reflections,
+                "selected_first_action_source": (
+                    decision_sources[0] if decision_sources else None
+                ),
+                "selected_first_action_trainable": (
+                    bool(decision_sources)
+                    and decision_sources[0] in TRAINABLE_TEACHER_ACTION_SOURCES
+                ),
+                "selected_path_trainable": trainable_path,
+                "verification": teacher_result.verification.to_dict(),
+                "answer_validation": (
+                    teacher_result.answer_validation.to_dict(
+                        include_reason=False
+                    )
+                    if teacher_result.answer_validation is not None
+                    else None
+                ),
+                "failure_diagnostics": teacher_result.failure_diagnostics,
+                "planner_calls": teacher_result.planner_calls,
+                "verifier_calls": teacher_result.verifier_calls,
+                "answer_validator_calls": (
+                    teacher_result.answer_validator_calls
+                ),
+            }
+        )
+
+        teacher_validation = teacher_result.answer_validation
+        if (
+            teacher_validation is None
+            or not teacher_validation.correct
+            or not teacher_result.decisions
+            or not trainable_path
+        ):
+            return
+        for decision_index, decision in enumerate(teacher_result.decisions):
+            if not _is_distillable_teacher_decision(decision):
+                continue
+            example = decision.sft_example(
+                sample.sample_id,
+                state_index,
+                sample.query,
+                self.validator.schema_text(),
+                allow_inspect_raw=self.validator.allow_inspect_raw,
+            )
+            example.sample_id = (
+                f"{sample.sample_id}:online:{round_index}:"
+                f"{state_index}:{decision_index}"
+            )
+            example.round_index = round_index
+            example.metadata.update(
+                {
+                    "online_state_index": state_index,
+                    "teacher_decision_index": decision_index,
+                    "teacher_trigger": self.teacher_trigger,
+                }
+            )
+            correction = OnlineCorrection(
+                sample_id=sample.sample_id,
+                state_index=state_index,
+                student_actions=list(student_actions),
+                student_raw_response=student_raw_response,
+                teacher_actions=list(decision.actions),
+                teacher_answer_validation=teacher_validation,
+                example=example,
+                teacher_action_source=decision.action_source,
+                teacher_verification=decision.verification_after.to_dict(),
+            )
+            corrections.append(correction)
+            self.buffer.add(example, round_index)
 
     def collect_sample(
         self,
@@ -306,54 +432,6 @@ class OnlineSelfDistiller:
             observation = session.observation()
             history = list(session.history)
 
-            teacher_result = self.teacher_search.search(
-                query=sample.query,
-                gold_answer=sample.gold_answer,
-                memory_store=sample.memory_store,
-                question_image=question_image,
-                initial_session=session,
-            )
-            decision_sources = [
-                decision.action_source for decision in teacher_result.decisions
-            ]
-            trainable_path = _is_trainable_teacher_path(
-                teacher_result.decisions
-            )
-            teacher_attempts.append(
-                {
-                    "state_index": state_index,
-                    "selected_actions": [
-                        action.to_dict() for action in teacher_result.actions
-                    ],
-                    "selected_action_sources": decision_sources,
-                    "selected_first_action_source": (
-                        decision_sources[0] if decision_sources else None
-                    ),
-                    "selected_first_action_trainable": (
-                        bool(decision_sources)
-                        and decision_sources[0]
-                        in TRAINABLE_TEACHER_ACTION_SOURCES
-                    ),
-                    "selected_path_trainable": trainable_path,
-                    "verification": teacher_result.verification.to_dict(),
-                    "answer_validation": (
-                        teacher_result.answer_validation.to_dict(
-                            include_reason=False
-                        )
-                        if teacher_result.answer_validation is not None
-                        else None
-                    ),
-                    "failure_diagnostics": (
-                        teacher_result.failure_diagnostics
-                    ),
-                    "planner_calls": teacher_result.planner_calls,
-                    "verifier_calls": teacher_result.verifier_calls,
-                    "answer_validator_calls": (
-                        teacher_result.answer_validator_calls
-                    ),
-                }
-            )
-
             try:
                 student_chunks = self.student_planner.propose(
                     query=sample.query,
@@ -376,56 +454,64 @@ class OnlineSelfDistiller:
                 getattr(self.student_planner, "last_raw_response", "") or ""
             ).strip()
 
-            teacher_validation = teacher_result.answer_validation
-            if (
-                teacher_validation is not None
-                and teacher_validation.correct
-                and teacher_result.decisions
-            ):
-                for decision_index, decision in enumerate(
-                    teacher_result.decisions
-                ):
-                    if not _is_distillable_teacher_decision(decision):
-                        continue
-                    if not trainable_path:
-                        continue
-                    example = decision.sft_example(
-                        sample.sample_id,
-                        state_index,
-                        sample.query,
-                        self.validator.schema_text(),
-                        allow_inspect_raw=self.validator.allow_inspect_raw,
-                    )
-                    example.sample_id = (
-                        f"{sample.sample_id}:online:{round_index}:"
-                        f"{state_index}:{decision_index}"
-                    )
-                    example.round_index = round_index
-                    example.metadata.update(
-                        {
-                            "online_state_index": state_index,
-                            "teacher_decision_index": decision_index,
-                        }
-                    )
-                    correction = OnlineCorrection(
-                        sample_id=sample.sample_id,
-                        state_index=state_index,
-                        student_actions=list(student_actions),
-                        student_raw_response=student_raw_response,
-                        teacher_actions=list(decision.actions),
-                        teacher_answer_validation=teacher_validation,
-                        example=example,
-                        teacher_action_source=decision.action_source,
-                        teacher_verification=(
-                            decision.verification_after.to_dict()
-                        ),
-                    )
-                    corrections.append(correction)
-                    self.buffer.add(example, round_index)
-
             if len(session.history) + len(student_actions) > self.max_student_actions:
                 break
+            correction_session = session
+            if all(action.tool == "STOP" for action in student_actions):
+                student_evidence_after = self.answer_validator.evaluate(
+                    sample.query,
+                    sample.gold_answer,
+                    session.evidence,
+                    question_image=question_image,
+                )
+                should_correct = (
+                    self.teacher_trigger == "always"
+                    or not student_evidence_after.correct
+                )
+                if should_correct:
+                    self._append_teacher_corrections(
+                        sample=sample,
+                        question_image=question_image,
+                        session=correction_session,
+                        state_index=state_index,
+                        round_index=round_index,
+                        student_actions=student_actions,
+                        student_raw_response=student_raw_response,
+                        corrections=corrections,
+                        teacher_attempts=teacher_attempts,
+                    )
+                session.execute_chunk(student_actions)
+                break
+
             session.execute_chunk(student_actions)
+            student_evidence_after = self.answer_validator.evaluate(
+                sample.query,
+                sample.gold_answer,
+                session.evidence,
+                question_image=question_image,
+            )
+            if (
+                self.stop_when_student_evidence_sufficient
+                and student_evidence_after.correct
+            ):
+                session.execute_chunk([ToolAction("STOP")])
+                break
+            should_correct = (
+                self.teacher_trigger == "always"
+                or not student_evidence_after.correct
+            )
+            if should_correct:
+                self._append_teacher_corrections(
+                    sample=sample,
+                    question_image=question_image,
+                    session=session,
+                    state_index=state_index,
+                    round_index=round_index,
+                    student_actions=student_actions,
+                    student_raw_response=student_raw_response,
+                    corrections=corrections,
+                    teacher_attempts=teacher_attempts,
+                )
 
         if not session.stopped:
             session.execute_chunk([ToolAction("STOP")])

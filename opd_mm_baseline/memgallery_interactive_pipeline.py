@@ -148,6 +148,7 @@ def _decision_rows(result: InteractiveSearchResult) -> List[Dict[str, Any]]:
             "verification_after": decision.verification_after.to_dict(),
             "planner_raw_response": decision.planner_raw_response,
             "action_source": decision.action_source,
+            "planner_rationale": dict(decision.planner_rationale),
         }
         for index, decision in enumerate(result.decisions)
     ]
@@ -292,6 +293,8 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             max_evidence=args.max_evidence,
             max_raw_inspections=args.max_raw_inspections,
             answer_validator=answer_validator,
+            trajectory_action_cost=args.trajectory_action_cost,
+            trajectory_evidence_cost=args.trajectory_evidence_cost,
         ),
         "policy_runner": InteractivePolicyRunner(
             planner=planner,
@@ -814,10 +817,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=9)
     parser.add_argument("--beam-size", type=int, default=2)
     parser.add_argument("--candidates-per-node", type=int, default=3)
-    parser.add_argument("--max-chunk-actions", type=int, default=1)
+    parser.add_argument("--max-chunk-actions", type=int, default=3)
     parser.add_argument("--max-actions", type=int, default=9)
     parser.add_argument("--max-top-k", type=int, default=50)
     parser.add_argument("--max-evidence", type=int, default=40)
+    parser.add_argument("--trajectory-action-cost", type=float, default=0.08)
+    parser.add_argument("--trajectory-evidence-cost", type=float, default=0.01)
     parser.add_argument("--hybrid-alpha", type=float, default=0.5)
     parser.add_argument("--dense-mode", choices=["minilm", "off"], default="minilm")
     parser.add_argument("--dense-model", default=default_minilm_model())

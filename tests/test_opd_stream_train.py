@@ -170,7 +170,7 @@ def test_streaming_examples_keep_every_validated_teacher_decision() -> None:
     assert "teacher_diagnosis" not in privileged
 
 
-def test_streaming_examples_skip_multi_action_teacher_targets() -> None:
+def test_streaming_examples_keep_multi_action_teacher_targets() -> None:
     result = _result('[{"tool":"RETRIEVE","method":"bm25"}]')
     first = result.corrections[0]
     first.teacher_actions = [
@@ -205,11 +205,14 @@ def test_streaming_examples_skip_multi_action_teacher_targets() -> None:
         quality_filter="teacher-correct",
     )
 
-    assert len(examples) == 1
+    assert len(examples) == 2
     assert _completion_actions(examples[0].completion) == [
+        {"tool": "RETRIEVE", "method": "hybrid", "top_k": 5},
+        {"tool": "READ", "fields": ["summary"]},
+    ]
+    assert _completion_actions(examples[1].completion) == [
         {"tool": "READ", "fields": ["summary"]}
     ]
-    assert all(len(_completion_actions(example.completion)) == 1 for example in examples)
 
 
 def test_streaming_examples_dedupe_same_state_to_best_target() -> None:
@@ -285,6 +288,62 @@ def test_streaming_examples_rebalance_toward_positive_states() -> None:
         positive_state_repeat=2,
     )
     assert [example.state_index for example in examples] == [1, 1]
+
+
+def test_streaming_examples_normalize_weight_per_trajectory() -> None:
+    result = _result('[{"tool":"RETRIEVE","method":"bm25"}]')
+    first = result.corrections[0]
+    for state_index in (1, 2):
+        result.corrections.append(
+            OnlineCorrection(
+                sample_id="sample",
+                state_index=state_index,
+                student_actions=[ToolAction("READ", {"fields": ["summary"]})],
+                teacher_actions=[ToolAction("STOP")],
+                teacher_answer_validation=first.teacher_answer_validation,
+                example=SFTExample(
+                    sample_id=f"sample:state{state_index}",
+                    input=f"student prompt state {state_index}",
+                    target='[{"tool":"STOP"}]',
+                    metadata={
+                        "teacher_decision_index": 0,
+                        "opd": {"teacher_input": "privileged teacher prompt"},
+                    },
+                ),
+                teacher_action_source="answer_stop",
+                teacher_verification={"answerable": True, "completeness": 1.0},
+            )
+        )
+    result.teacher_attempts = [
+        {
+            "state_index": 0,
+            "selected_action_count": 3,
+            "selected_evidence_count": 9,
+        },
+        {
+            "state_index": 1,
+            "selected_action_count": 3,
+            "selected_evidence_count": 9,
+        },
+        {
+            "state_index": 2,
+            "selected_action_count": 3,
+            "selected_evidence_count": 9,
+        },
+    ]
+    examples = streaming_examples_from_result(
+        result,
+        quality_filter="teacher-correct",
+        positive_state_repeat=1,
+        normalize_trajectory_weight=True,
+    )
+    assert len(examples) == 3
+    assert round(sum(example.sample_weight for example in examples), 6) == 1.0
+    assert {round(example.sample_weight, 6) for example in examples} == {
+        round(1.0 / 3.0, 6)
+    }
+    assert all(example.trajectory_action_count == 3 for example in examples)
+    assert all(example.trajectory_evidence_count == 9 for example in examples)
 
 
 def test_head_tail_truncation_preserves_prompt_front_and_back() -> None:

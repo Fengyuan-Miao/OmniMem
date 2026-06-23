@@ -151,6 +151,8 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         raw_inspector=raw_inspector,
         max_raw_inspections=args.max_raw_inspections,
         answer_validator=answer_validator,
+        trajectory_action_cost=args.trajectory_action_cost,
+        trajectory_evidence_cost=args.trajectory_evidence_cost,
     )
     return {
         "validator": validator,
@@ -339,6 +341,10 @@ def run_scenario(
         buffer=buffer,
         raw_inspector=components["raw_inspector"],
         max_raw_inspections=args.max_raw_inspections,
+        teacher_trigger=args.teacher_trigger,
+        stop_when_student_evidence_sufficient=(
+            args.stop_when_student_evidence_sufficient
+        ),
     )
     round_summaries = []
     for round_index in range(args.distill_rounds):
@@ -492,7 +498,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--teacher-max-actions", type=int, default=9)
     parser.add_argument("--teacher-beam-size", type=int, default=2)
     parser.add_argument("--teacher-candidates", type=int, default=3)
-    parser.add_argument("--max-chunk-actions", type=int, default=1)
+    parser.add_argument("--max-chunk-actions", type=int, default=3)
     parser.add_argument("--max-actions", type=int, default=9)
     parser.add_argument("--max-top-k", type=int, default=50)
     parser.add_argument("--max-evidence", type=int, default=40)
@@ -526,6 +532,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--teacher-dtype", default="auto")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
     parser.add_argument("--planner-thinking-token-budget", type=int, default=256)
+    parser.add_argument(
+        "--student-planner-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--teacher-planner-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--student-prompt-mode",
         choices=["student_simple", "teacher_compact"],
@@ -564,6 +580,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--judge-api-key", default="ollama")
     parser.add_argument("--judge-max-tokens", type=int, default=192)
     parser.add_argument("--min-answer-score", type=float, default=0.9)
+    parser.add_argument(
+        "--teacher-trigger",
+        choices=["failure", "always"],
+        default="failure",
+        help=(
+            "failure runs teacher correction only after the current student "
+            "state fails evidence validation; always labels every visited "
+            "student state."
+        ),
+    )
     parser.add_argument(
         "--student-update-command",
         default=None,

@@ -139,6 +139,10 @@ class StreamingExample:
     teacher_verification: Dict[str, Any]
     student_actions: List[Dict[str, Any]]
     teacher_actions: List[Dict[str, Any]]
+    sample_weight: float = 1.0
+    trajectory_action_count: int = 0
+    trajectory_evidence_count: int = 0
+    trajectory_cost: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -157,6 +161,10 @@ class StreamingExample:
             "teacher_verification": self.teacher_verification,
             "student_actions": self.student_actions,
             "teacher_actions": self.teacher_actions,
+            "sample_weight": self.sample_weight,
+            "trajectory_action_count": self.trajectory_action_count,
+            "trajectory_evidence_count": self.trajectory_evidence_count,
+            "trajectory_cost": self.trajectory_cost,
         }
 
     @classmethod
@@ -185,6 +193,10 @@ class StreamingExample:
             teacher_verification=dict(value.get("teacher_verification") or {}),
             student_actions=list(value.get("student_actions") or []),
             teacher_actions=list(value.get("teacher_actions") or []),
+            sample_weight=float(value.get("sample_weight", 1.0)),
+            trajectory_action_count=int(value.get("trajectory_action_count", 0)),
+            trajectory_evidence_count=int(value.get("trajectory_evidence_count", 0)),
+            trajectory_cost=float(value.get("trajectory_cost", 0.0)),
         )
 
 
@@ -354,7 +366,7 @@ def render_policy_prompt(
 
 def _teacher_completion(correction: OnlineCorrection) -> Optional[str]:
     actions = [action.to_dict() for action in correction.teacher_actions]
-    if len(actions) != 1:
+    if not actions:
         return None
     return json.dumps(
         actions,
@@ -400,7 +412,20 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _streaming_example_rank(example: StreamingExample) -> tuple:
+def _example_action_count(example: StreamingExample) -> int:
+    return max(1, int(example.trajectory_action_count or len(example.teacher_actions)))
+
+
+def _example_evidence_count(example: StreamingExample) -> int:
+    return max(0, int(example.trajectory_evidence_count or 0))
+
+
+def _streaming_example_rank(
+    example: StreamingExample,
+    *,
+    action_cost: float = 0.0,
+    evidence_cost: float = 0.0,
+) -> tuple:
     verification = example.teacher_verification or {}
     source_priority = {
         "planner": 3,
@@ -408,14 +433,29 @@ def _streaming_example_rank(example: StreamingExample) -> tuple:
         "answer_stop": 1,
         "verifier_stop": 1,
     }.get(example.teacher_action_source, 0)
+    total_cost = (
+        float(action_cost) * _example_action_count(example)
+        + float(evidence_cost) * _example_evidence_count(example)
+        + float(example.trajectory_cost)
+    )
+    evidence_sufficient = (
+        bool(verification.get("answerable"))
+        or _safe_float(verification.get("completeness")) >= 0.99
+    )
+    stop_when_sufficient = int(
+        evidence_sufficient and _actions_are_stop(example.teacher_actions)
+    )
     return (
         int(example.teacher_answer_correct),
         float(example.teacher_answer_score),
+        -total_cost,
+        stop_when_sufficient,
         _safe_float(verification.get("completeness")),
         _safe_float(verification.get("relevance")),
         int(_actions_are_stop(example.teacher_actions)),
         source_priority,
-        -len(example.teacher_actions),
+        -_example_action_count(example),
+        -_example_evidence_count(example),
         -len(example.completion),
         -example.teacher_decision_index,
     )
@@ -423,13 +463,24 @@ def _streaming_example_rank(example: StreamingExample) -> tuple:
 
 def _select_best_state_targets(
     examples: List[StreamingExample],
+    *,
+    action_cost: float = 0.0,
+    evidence_cost: float = 0.0,
 ) -> List[StreamingExample]:
     best_by_state: Dict[str, StreamingExample] = {}
     for example in examples:
         current = best_by_state.get(example.state_key)
         if current is None or (
-            _streaming_example_rank(example)
-            > _streaming_example_rank(current)
+            _streaming_example_rank(
+                example,
+                action_cost=action_cost,
+                evidence_cost=evidence_cost,
+            )
+            > _streaming_example_rank(
+                current,
+                action_cost=action_cost,
+                evidence_cost=evidence_cost,
+            )
         ):
             best_by_state[example.state_key] = example
     return sorted(
@@ -465,6 +516,7 @@ def _rebalance_state_examples(
     *,
     state0_keep_ratio: float,
     positive_state_repeat: int,
+    trajectory_normalize: bool = False,
 ) -> List[StreamingExample]:
     state0 = [example for example in examples if example.state_index <= 0]
     positive = [example for example in examples if example.state_index > 0]
@@ -483,6 +535,17 @@ def _rebalance_state_examples(
     repeat = max(1, int(positive_state_repeat))
     for example in positive:
         selected.extend([example] * repeat)
+    if trajectory_normalize:
+        counts: Counter = Counter(example.sample_id for example in selected)
+        normalized: List[StreamingExample] = []
+        for example in selected:
+            cloned = copy.copy(example)
+            cloned.sample_weight = float(example.sample_weight) / max(
+                1,
+                counts[example.sample_id],
+            )
+            normalized.append(cloned)
+        return normalized
     return selected
 
 
@@ -493,6 +556,9 @@ def streaming_examples_from_result(
     policy_version: int = 0,
     state0_keep_ratio: float = 1.0,
     positive_state_repeat: int = 1,
+    trajectory_action_cost: float = 0.0,
+    trajectory_evidence_cost: float = 0.0,
+    normalize_trajectory_weight: bool = False,
 ) -> List[StreamingExample]:
     if quality_filter == "student-answer-failure":
         if result.student_answer_validation.correct:
@@ -531,6 +597,21 @@ def streaming_examples_from_result(
         attempt = attempts.get(state_index, {})
         prompt = correction.example.input
         verification = dict(correction.teacher_verification or {})
+        attempt = attempts.get(state_index, {})
+        trajectory_action_count = int(
+            attempt.get("selected_action_count")
+            or attempt.get("trajectory_action_count")
+            or len(correction.teacher_actions)
+        )
+        trajectory_evidence_count = int(
+            attempt.get("selected_evidence_count")
+            or attempt.get("trajectory_evidence_count")
+            or 0
+        )
+        trajectory_cost = (
+            float(trajectory_action_cost) * trajectory_action_count
+            + float(trajectory_evidence_cost) * trajectory_evidence_count
+        )
         examples.append(
             StreamingExample(
                 sample_id=result.sample_id,
@@ -554,13 +635,22 @@ def streaming_examples_from_result(
                 teacher_actions=[
                     action.to_dict() for action in correction.teacher_actions
                 ],
+                sample_weight=1.0,
+                trajectory_action_count=trajectory_action_count,
+                trajectory_evidence_count=trajectory_evidence_count,
+                trajectory_cost=trajectory_cost,
             )
         )
-    deduped = _select_best_state_targets(examples)
+    deduped = _select_best_state_targets(
+        examples,
+        action_cost=trajectory_action_cost,
+        evidence_cost=trajectory_evidence_cost,
+    )
     return _rebalance_state_examples(
         deduped,
         state0_keep_ratio=state0_keep_ratio,
         positive_state_repeat=positive_state_repeat,
+        trajectory_normalize=normalize_trajectory_weight,
     )
 
 
@@ -768,6 +858,7 @@ def build_distillation_batch(
     teacher_lengths: List[int] = []
     student_truncated: List[bool] = []
     teacher_truncated: List[bool] = []
+    sample_weights: List[float] = []
     for example in examples:
         student_ids_full = render_policy_prompt(
             tokenizer,
@@ -802,6 +893,7 @@ def build_distillation_batch(
         student_prompts.append(student_ids)
         teacher_prompts.append(teacher_ids)
         completions.append(completion_ids)
+        sample_weights.append(max(0.0, float(example.sample_weight)))
 
     student_ids, student_mask = _pad(
         student_prompts,
@@ -834,6 +926,11 @@ def build_distillation_batch(
         ),
         "completion_ids": completion_ids,
         "completion_mask": completion_mask,
+        "sample_weights": torch.tensor(
+            sample_weights,
+            dtype=torch.float32,
+            device=device,
+        ),
         "prompt_stats": {
             **_prompt_batch_stats(
                 student_lengths,
@@ -1041,6 +1138,7 @@ def masked_completion_nll(
     student_logits: torch.Tensor,
     completion_ids: torch.Tensor,
     completion_mask: torch.Tensor,
+    sample_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     per_token = F.cross_entropy(
         student_logits.transpose(1, 2),
@@ -1048,6 +1146,9 @@ def masked_completion_nll(
         reduction="none",
     )
     mask = completion_mask.to(per_token.dtype)
+    if sample_weights is not None:
+        weights = sample_weights.to(per_token.dtype).view(-1, 1)
+        mask = mask * weights
     return (per_token * mask).sum() / mask.sum().clamp(min=1.0)
 
 
@@ -1108,6 +1209,7 @@ def train_distillation_batch(
                 student_logits,
                 batch["completion_ids"],
                 batch["completion_mask"],
+                batch["sample_weights"],
             )
             student_log_probs, top_indices = _student_distillation_stats(
                 student_logits,
@@ -1124,7 +1226,8 @@ def train_distillation_batch(
             kl_loss = reverse_kl_topk_log_probs(
                 student_log_probs,
                 teacher_log_probs,
-                batch["completion_mask"],
+                batch["completion_mask"].to(batch["sample_weights"].dtype)
+                * batch["sample_weights"].view(-1, 1),
                 add_tail=args.distill_add_tail,
             ) * (temperature**2)
             loss = (
@@ -1448,6 +1551,7 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         max_student_actions=args.max_actions,
         raw_inspector=components["raw_inspector"],
         max_raw_inspections=args.max_raw_inspections,
+        teacher_trigger=args.teacher_trigger,
     )
 
     local_iterator = iter(
@@ -1469,7 +1573,7 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
     supervision_first_tool_counts: Counter = Counter()
     supervision_trajectory_shape_counts: Counter = Counter()
     supervision_action_source_counts: Counter = Counter()
-    atomic_skipped_multi_action_targets = 0
+    multi_action_targets = 0
     rollout_batch_index = 0
     started = time.time()
     rollouts_path = run_dir / "online_rollouts.jsonl"
@@ -1489,7 +1593,7 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
 
         local_rollouts = []
         local_examples = []
-        local_skipped_multi_action_targets = 0
+        local_multi_action_targets = 0
         if local_batch is not None:
             for sample in local_batch:
                 result = distiller.collect_sample(
@@ -1499,10 +1603,10 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
                 rollout_row = result.to_dict()
                 rollout_row["policy_version"] = optimizer_step
                 local_rollouts.append(rollout_row)
-                local_skipped_multi_action_targets += sum(
+                local_multi_action_targets += sum(
                     1
                     for correction in result.corrections
-                    if len(correction.teacher_actions) != 1
+                    if len(correction.teacher_actions) > 1
                 )
                 local_examples.extend(
                     example.to_dict()
@@ -1512,13 +1616,18 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
                         policy_version=optimizer_step,
                         state0_keep_ratio=args.state0_keep_ratio,
                         positive_state_repeat=args.positive_state_repeat,
+                        trajectory_action_cost=args.trajectory_action_cost,
+                        trajectory_evidence_cost=args.trajectory_evidence_cost,
+                        normalize_trajectory_weight=(
+                            args.normalize_trajectory_weight
+                        ),
                     )
                 )
 
         gathered_rollouts = gather_object(local_rollouts)
         gathered_examples = gather_object(local_examples)
-        gathered_skipped_multi_action_targets = gather_object(
-            [local_skipped_multi_action_targets]
+        gathered_multi_action_targets = gather_object(
+            [local_multi_action_targets]
         )
         new_examples = [
             StreamingExample.from_dict(value)
@@ -1527,8 +1636,8 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         pending.extend(new_examples)
         samples_seen += len(gathered_rollouts)
         examples_seen += len(new_examples)
-        atomic_skipped_multi_action_targets += sum(
-            int(value) for value in gathered_skipped_multi_action_targets
+        multi_action_targets += sum(
+            int(value) for value in gathered_multi_action_targets
         )
         _update_supervision_counters(
             new_examples,
@@ -1582,8 +1691,8 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
                         ),
                         "online/samples_seen": samples_seen,
                         "online/examples_seen": examples_seen,
-                        "online/atomic_skipped_multi_action_targets": (
-                            atomic_skipped_multi_action_targets
+                        "online/multi_action_targets": (
+                            multi_action_targets
                         ),
                     }
                 log_payload.update(
@@ -1643,8 +1752,8 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
                     ),
                     "online/samples_seen": samples_seen,
                     "online/examples_seen": examples_seen,
-                    "online/atomic_skipped_multi_action_targets": (
-                        atomic_skipped_multi_action_targets
+                    "online/multi_action_targets": (
+                        multi_action_targets
                     ),
                 }
             log_payload.update(
@@ -1672,9 +1781,7 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
             "samples_seen": samples_seen,
             "on_policy_examples": examples_seen,
             "optimizer_steps": optimizer_step,
-            "atomic_skipped_multi_action_targets": (
-                atomic_skipped_multi_action_targets
-            ),
+            "multi_action_targets": multi_action_targets,
             "elapsed_seconds": elapsed,
             "samples_per_second": samples_seen / max(elapsed, 1e-6),
             "mean_loss": (

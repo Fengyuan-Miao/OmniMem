@@ -149,6 +149,7 @@ def _make_distiller(args: argparse.Namespace, components: Dict[str, Any]) -> Onl
         buffer=OnlineDistillationBuffer(args.max_buffer_examples),
         raw_inspector=components["raw_inspector"],
         max_raw_inspections=args.max_raw_inspections,
+        teacher_trigger=args.teacher_trigger,
     )
 
 
@@ -406,7 +407,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--teacher-max-actions", type=int, default=9)
     parser.add_argument("--teacher-beam-size", type=int, default=2)
     parser.add_argument("--teacher-candidates", type=int, default=3)
-    parser.add_argument("--max-chunk-actions", type=int, default=1)
+    parser.add_argument("--max-chunk-actions", type=int, default=3)
     parser.add_argument("--max-actions", type=int, default=9)
     parser.add_argument("--max-top-k", type=int, default=50)
     parser.add_argument("--max-evidence", type=int, default=40)
@@ -494,6 +495,16 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
             "student-sufficiency-failure",
         ],
         default="teacher-correct",
+    )
+    parser.add_argument(
+        "--teacher-trigger",
+        choices=["failure", "always"],
+        default="failure",
+        help=(
+            "failure runs teacher correction only after the current student "
+            "state fails evidence validation; always preserves the older "
+            "label-every-visited-state behavior."
+        ),
     )
     parser.add_argument("--no-progress", action="store_true")
 

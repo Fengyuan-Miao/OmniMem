@@ -556,6 +556,42 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-completion-length", type=int, default=128)
     parser.add_argument("--state0-keep-ratio", type=float, default=0.35)
     parser.add_argument("--positive-state-repeat", type=int, default=2)
+    parser.add_argument(
+        "--trajectory-action-cost",
+        type=float,
+        default=0.08,
+        help=(
+            "Cost used when selecting teacher targets and ranking teacher "
+            "search paths. Larger values prefer shorter successful paths."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-evidence-cost",
+        type=float,
+        default=0.01,
+        help=(
+            "Cost used when selecting teacher targets and ranking teacher "
+            "search paths. Larger values prefer less bloated evidence sets."
+        ),
+    )
+    parser.add_argument(
+        "--normalize-trajectory-weight",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Normalize total supervised weight per sample so long successful "
+            "trajectories do not dominate state-level training."
+        ),
+    )
+    parser.add_argument(
+        "--stop-when-student-evidence-sufficient",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "During online rollout collection only, stop the student path once "
+            "the answer validator judges current evidence sufficient."
+        ),
+    )
     parser.add_argument("--distill-top-k", type=int, default=32)
     parser.add_argument(
         "--distill-add-tail",
