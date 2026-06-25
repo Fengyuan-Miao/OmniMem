@@ -6,9 +6,11 @@ import base64
 import io
 import json
 import mimetypes
+import os
 import re
 import time
 import urllib.request
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -287,11 +289,47 @@ class OpenAICompatibleClient:
         model: str,
         api_key: str = "ollama",
         timeout: int = 180,
+        service_mode: str = "auto",
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.api_key = api_key
+        if str(api_key or "").startswith("env:"):
+            self.api_key = os.environ.get(str(api_key).split(":", 1)[1], "")
+        else:
+            self.api_key = api_key
         self.timeout = timeout
+        self.service_mode = self._resolve_service_mode(service_mode)
+
+    def _resolve_service_mode(self, service_mode: str) -> str:
+        mode = str(service_mode or "auto").lower()
+        if mode not in {"auto", "local", "api"}:
+            raise ValueError(f"invalid service_mode: {service_mode}")
+        if mode != "auto":
+            return mode
+        host = (urlparse(self.base_url).hostname or "").lower()
+        if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+            return "local"
+        return "api"
+
+    @property
+    def allows_local_chat_extensions(self) -> bool:
+        return self.service_mode == "local"
+
+    def _filter_extra_body(
+        self,
+        extra_body: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not extra_body:
+            return {}
+        filtered = dict(extra_body)
+        if self.allows_local_chat_extensions:
+            return filtered
+        for key in (
+            "thinking_token_budget",
+            "chat_template_kwargs",
+        ):
+            filtered.pop(key, None)
+        return filtered
 
     def complete(
         self,
@@ -302,7 +340,10 @@ class OpenAICompatibleClient:
         prefill_assistant: str = "",
     ) -> str:
         request_messages = list(messages)
-        if prefill_assistant:
+        use_prefill = bool(
+            prefill_assistant and self.allows_local_chat_extensions
+        )
+        if use_prefill:
             request_messages.append(
                 {"role": "assistant", "content": str(prefill_assistant)}
             )
@@ -312,11 +353,10 @@ class OpenAICompatibleClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if prefill_assistant:
+        if use_prefill:
             body["add_generation_prompt"] = False
             body["continue_final_message"] = True
-        if extra_body:
-            body.update(extra_body)
+        body.update(self._filter_extra_body(extra_body))
         payload = json.dumps(
             body,
         ).encode("utf-8")

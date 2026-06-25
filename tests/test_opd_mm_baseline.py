@@ -6,11 +6,18 @@ import pytest
 from opd_mm_baseline.clients import (
     ChatAnswerModel,
     ChatHindsightTeacher,
+    OpenAICompatibleClient,
     extract_json_array,
 )
 from opd_mm_baseline.executor import ToolExecutor
 from opd_mm_baseline.memgallery import build_scenario_store, scenario_samples
 from opd_mm_baseline.memgallery_pipeline import select_sft_example
+from opd_mm_baseline.memeye import (
+    build_scenario_store as build_memeye_scenario_store,
+    normalize_memeye_dialog_image_paths,
+    normalize_memeye_image_path,
+    scenario_samples as memeye_scenario_samples,
+)
 from opd_mm_baseline.models import (
     EvidenceItem,
     MemoryRecord,
@@ -154,6 +161,74 @@ class CapturingRawInspector:
             }
         )
         return "same visual type; text label says Cairn Terrier"
+
+
+def test_openai_client_filters_local_extensions_for_api(monkeypatch):
+    requests = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {"choices": [{"message": {"content": "ok"}}]}
+            ).encode("utf-8")
+
+    class FakeOpener:
+        def open(self, request, timeout=0):
+            requests.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "urllib.request.build_opener",
+        lambda *_args, **_kwargs: FakeOpener(),
+    )
+    api_client = OpenAICompatibleClient(
+        "https://api.example.com/v1",
+        "model",
+        "key",
+        service_mode="api",
+    )
+    api_client.complete(
+        [{"role": "user", "content": "hello"}],
+        extra_body={
+            "thinking_token_budget": 128,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "foo": "bar",
+        },
+        prefill_assistant="</think>\n\n",
+    )
+    local_client = OpenAICompatibleClient(
+        "http://127.0.0.1:11438/v1",
+        "model",
+        "key",
+        service_mode="local",
+    )
+    local_client.complete(
+        [{"role": "user", "content": "hello"}],
+        extra_body={
+            "thinking_token_budget": 128,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "foo": "bar",
+        },
+        prefill_assistant="</think>\n\n",
+    )
+
+    assert requests[0]["foo"] == "bar"
+    assert "thinking_token_budget" not in requests[0]
+    assert "chat_template_kwargs" not in requests[0]
+    assert "add_generation_prompt" not in requests[0]
+    assert requests[0]["messages"][-1]["role"] == "user"
+
+    assert requests[1]["thinking_token_budget"] == 128
+    assert requests[1]["chat_template_kwargs"]["enable_thinking"] is False
+    assert requests[1]["add_generation_prompt"] is False
+    assert requests[1]["continue_final_message"] is True
+    assert requests[1]["messages"][-1]["role"] == "assistant"
 
 
 def test_validator_rejects_memory_ids_and_custom_search_queries():
@@ -885,6 +960,66 @@ def test_memgallery_adapter_splits_text_and_image_memories(tmp_path):
     ]
     assert advice["recommended"]["minimum_top_k"] >= 1
     assert advice["trajectory_shape"] == ["RETRIEVE", "READ", "STOP"]
+
+
+def test_memeye_paths_are_normalized_to_memgallery_image_format(tmp_path):
+    image_dir = tmp_path / "data" / "image" / "Brand_Memory_Test"
+    image_dir.mkdir(parents=True)
+    image_path = image_dir / "CocaCola_1.png"
+    image_path.write_bytes(b"image")
+    avatar_dir = tmp_path / "data" / "image" / "Social_Chat_Memory_Test" / "avatars"
+    avatar_dir.mkdir(parents=True)
+    question_image = avatar_dir / "P01_marcus.png"
+    question_image.write_bytes(b"avatar")
+    data = {
+        "multi_session_dialogues": [
+            {
+                "session_id": "S1",
+                "date": "2024-01-01",
+                "dialogues": [
+                    {
+                        "round": "S1:1",
+                        "user": "I saw a Coca-Cola ad.",
+                        "assistant": "Noted.",
+                        "image_id": ["CC1:IMG_001"],
+                        "input_image": ["Brand_Memory_Test/CocaCola_1.png"],
+                        "image_caption": ["A red Coca-Cola campaign image."],
+                    }
+                ],
+            }
+        ],
+        "human-annotated QAs": [
+            {
+                "question_id": "Q1",
+                "question": "Which brand was shown?",
+                "answer": "Coca-Cola",
+                "question_image": "Social_Chat_Memory_Test/avatars/P01_marcus.png",
+            }
+        ],
+    }
+
+    assert normalize_memeye_image_path("Brand_Memory_Test/CocaCola_1.png") == (
+        "../image/Brand_Memory_Test/CocaCola_1.png"
+    )
+    normalized_data = normalize_memeye_dialog_image_paths(json.loads(json.dumps(data)))
+    assert normalized_data["multi_session_dialogues"][0]["dialogues"][0][
+        "input_image"
+    ] == ["../image/Brand_Memory_Test/CocaCola_1.png"]
+    assert normalized_data["human-annotated QAs"][0]["question_image"] == (
+        "../image/Social_Chat_Memory_Test/avatars/P01_marcus.png"
+    )
+
+    store, records = build_memeye_scenario_store(data, tmp_path)
+    samples = memeye_scenario_samples(data, store, tmp_path, "Brand_Memory_Test_Open")
+    assert [record.modality for record in records] == ["text", "image"]
+    assert records[-1].metadata["relative_path"] == (
+        "../image/Brand_Memory_Test/CocaCola_1.png"
+    )
+    assert records[-1].metadata["source_relative_path"] == (
+        "Brand_Memory_Test/CocaCola_1.png"
+    )
+    assert records[-1].raw_pointer == str(image_path.resolve())
+    assert samples[0].metadata["question_image"] == str(question_image.resolve())
 
 
 def test_support_verified_sft_filter_rejects_unverified_corrections():

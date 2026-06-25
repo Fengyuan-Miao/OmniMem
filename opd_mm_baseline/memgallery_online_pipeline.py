@@ -51,6 +51,7 @@ def _make_chat_client(
     base_url: str,
     model: str,
     api_key: str,
+    service_mode: str = "auto",
     device: str,
     dtype: str,
     hf_cache: Dict[tuple[str, str, str], HFQwenVLClient],
@@ -60,7 +61,12 @@ def _make_chat_client(
         if key not in hf_cache:
             hf_cache[key] = HFQwenVLClient(model, device=device, dtype=dtype)
         return hf_cache[key]
-    return OpenAICompatibleClient(base_url, model, api_key)
+    return OpenAICompatibleClient(
+        base_url,
+        model,
+        api_key,
+        service_mode=service_mode,
+    )
 
 
 def make_components(args: argparse.Namespace) -> Dict[str, Any]:
@@ -76,6 +82,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             base_url=args.student_base_url,
             model=args.student_model,
             api_key=args.student_api_key,
+            service_mode=getattr(args, "student_service", "auto"),
             device=args.student_device,
             dtype=args.student_dtype,
             hf_cache=hf_cache,
@@ -92,6 +99,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             base_url=args.teacher_base_url,
             model=args.teacher_model,
             api_key=args.teacher_api_key,
+            service_mode=getattr(args, "teacher_service", "auto"),
             device=args.teacher_device,
             dtype=args.teacher_dtype,
             hf_cache=hf_cache,
@@ -113,6 +121,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.answer_base_url,
             args.answer_model,
             args.answer_api_key,
+            service_mode=getattr(args, "answer_service", "auto"),
         )
     answer_model = ChatAnswerModel(
         answer_client,
@@ -129,6 +138,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.judge_base_url,
             args.judge_model,
             args.judge_api_key,
+            service_mode=getattr(args, "judge_service", "auto"),
         ),
         max_tokens=args.judge_max_tokens,
     )
@@ -518,6 +528,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--student-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--student-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--student-api-key", default="ollama")
+    parser.add_argument(
+        "--student-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--student-device", default="cuda:1")
     parser.add_argument("--student-dtype", default="auto")
     parser.add_argument(
@@ -528,6 +543,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--teacher-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--teacher-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--teacher-api-key", default="ollama")
+    parser.add_argument(
+        "--teacher-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--teacher-device", default="cuda:1")
     parser.add_argument("--teacher-dtype", default="auto")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
@@ -564,6 +584,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument(
+        "--answer-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--answer-device", default="cuda:1")
     parser.add_argument("--answer-dtype", default="auto")
     parser.add_argument("--answer-max-tokens", type=int, default=128)
@@ -578,6 +603,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--judge-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--judge-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--judge-api-key", default="ollama")
+    parser.add_argument(
+        "--judge-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--judge-max-tokens", type=int, default=192)
     parser.add_argument("--min-answer-score", type=float, default=0.9)
     parser.add_argument(

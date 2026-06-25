@@ -14,6 +14,7 @@ from .retrieval import DenseEncoder, HiddenMemoryStore, VisionEncoder
 IMAGE_ID_PATTERN = re.compile(
     r"\b(?:[A-Za-z0-9_-]+:)?IMG_\d+\b|\b[A-Z]{1,4}\d*:\d+\b"
 )
+MEMGALLERY_IMAGE_PREFIX = "../image/"
 
 DEFAULT_OPEN_TASKS = [
     "Brand_Memory_Test_Open",
@@ -70,11 +71,63 @@ def iter_task_paths(
     return paths
 
 
+def normalize_memeye_image_path(value: Any) -> str:
+    """Convert MemEye image paths to the Mem-Gallery ../image/... convention."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw)
+    if path.is_absolute():
+        return raw
+
+    normalized = raw.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    if normalized.startswith(MEMGALLERY_IMAGE_PREFIX):
+        return normalized
+    if normalized.startswith("data/image/"):
+        normalized = normalized[len("data/image/") :]
+    elif normalized.startswith("image/"):
+        normalized = normalized[len("image/") :]
+    elif normalized.startswith("../data/image/"):
+        normalized = normalized[len("../data/image/") :]
+    return f"{MEMGALLERY_IMAGE_PREFIX}{normalized.lstrip('/')}"
+
+
+def normalize_memeye_dialog_image_paths(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize MemEye input_image/question_image fields in-place and return data."""
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            images = item.get("input_image")
+            if isinstance(images, list):
+                item["input_image"] = [
+                    normalize_memeye_image_path(value) for value in images
+                ]
+            elif images:
+                item["input_image"] = [normalize_memeye_image_path(images)]
+
+            question_image = item.get("question_image")
+            if question_image:
+                item["question_image"] = normalize_memeye_image_path(question_image)
+
+            for value in item.values():
+                visit(value)
+        elif isinstance(item, list):
+            for value in item:
+                visit(value)
+
+    visit(data)
+    return data
+
+
 def resolve_image_path(data_dir: Path, value: str) -> Path:
-    path = Path(str(value or ""))
+    normalized = normalize_memeye_image_path(value)
+    path = Path(normalized)
     if path.is_absolute():
         return path
     candidates = [
+        data_dir / "data" / "dialog" / path,
         data_dir / "data" / "image" / path,
         data_dir / "data" / "dialog" / path,
         data_dir / path,
@@ -184,9 +237,12 @@ def scenario_records(
 
             image_ids = turn.get("image_id") or []
             image_paths = turn.get("input_image") or []
+            if isinstance(image_paths, (str, Path)):
+                image_paths = [image_paths]
             captions = turn.get("image_caption") or []
             for image_index, relative_path in enumerate(image_paths):
-                path = resolve_image_path(data_dir, str(relative_path))
+                normalized_path = normalize_memeye_image_path(relative_path)
+                path = resolve_image_path(data_dir, normalized_path)
                 if not is_real_image_file(path):
                     continue
                 image_id = str(
@@ -201,7 +257,8 @@ def scenario_records(
                 metadata.update(
                     {
                         "public_image_id": image_id,
-                        "relative_path": str(relative_path),
+                        "relative_path": normalized_path,
+                        "source_relative_path": str(relative_path),
                         "image_index": image_index,
                     }
                 )

@@ -221,6 +221,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.planner_base_url,
             args.planner_model,
             args.planner_api_key,
+            service_mode=getattr(args, "planner_service", "auto"),
         ),
         validator=validator,
         max_tokens=args.planner_max_tokens,
@@ -241,6 +242,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.answer_base_url,
             args.answer_model,
             args.answer_api_key,
+            service_mode=getattr(args, "answer_service", "auto"),
         )
         answer_model = ChatAnswerModel(
             answer_client,
@@ -258,6 +260,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
                     args.judge_base_url,
                     args.judge_model,
                     args.judge_api_key,
+                    service_mode=getattr(args, "judge_service", "auto"),
                 ),
                 max_tokens=args.judge_max_tokens,
             )
@@ -837,6 +840,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--planner-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--planner-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--planner-api-key", default="ollama")
+    parser.add_argument(
+        "--planner-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--planner-max-tokens", type=int, default=768)
     parser.add_argument("--planner-thinking-token-budget", type=int, default=256)
     parser.add_argument(
@@ -879,6 +887,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument(
+        "--answer-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--answer-max-tokens", type=int, default=128)
     parser.add_argument("--answer-max-images", type=int, default=3)
     parser.add_argument("--raw-inspection", action="store_true")
@@ -888,6 +901,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--judge-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--judge-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--judge-api-key", default="ollama")
+    parser.add_argument(
+        "--judge-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--judge-max-tokens", type=int, default=192)
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args(argv)

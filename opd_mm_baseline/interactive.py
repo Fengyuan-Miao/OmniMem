@@ -1841,6 +1841,7 @@ class ChatInteractivePlanner:
         extra_body: Dict[str, Any] = {}
         if (
             self.thinking_token_budget is not None
+            and self.thinking_token_budget > 0
             and self.enable_thinking is not False
         ):
             extra_body["thinking_token_budget"] = self.thinking_token_budget

@@ -427,6 +427,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--student-base-url", default="http://127.0.0.1:11438/v1")
     parser.add_argument("--student-model", default="qwen3-vl-4b-thinking-vllm")
     parser.add_argument("--student-api-key", default="ollama")
+    parser.add_argument(
+        "--student-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--student-device", default="cuda:1")
     parser.add_argument("--student-dtype", default="auto")
     parser.add_argument(
@@ -437,6 +442,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--teacher-base-url", default="http://127.0.0.1:11438/v1")
     parser.add_argument("--teacher-model", default="qwen3-vl-4b-thinking-vllm")
     parser.add_argument("--teacher-api-key", default="ollama")
+    parser.add_argument(
+        "--teacher-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--teacher-device", default="cuda:1")
     parser.add_argument("--teacher-dtype", default="auto")
     parser.add_argument("--planner-max-tokens", type=int, default=768)
@@ -469,6 +479,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument(
+        "--answer-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--answer-device", default="cuda:1")
     parser.add_argument("--answer-dtype", default="auto")
     parser.add_argument("--answer-max-tokens", type=int, default=128)
@@ -483,6 +498,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--judge-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--judge-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--judge-api-key", default="ollama")
+    parser.add_argument(
+        "--judge-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--judge-max-tokens", type=int, default=192)
     parser.add_argument("--min-answer-score", type=float, default=0.9)
     parser.add_argument("--val-ratio", type=float, default=0.1)

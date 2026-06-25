@@ -127,6 +127,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
         args.student_base_url,
         args.student_model,
         args.student_api_key,
+        service_mode=getattr(args, "student_service", "auto"),
     )
     student = ChatStudentPolicy(
         student_client,
@@ -139,6 +140,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
                 args.teacher_base_url,
                 args.teacher_model,
                 args.teacher_api_key,
+                service_mode=getattr(args, "teacher_service", "auto"),
             ),
             validator=validator,
             max_tokens=args.policy_max_tokens,
@@ -155,6 +157,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.answer_base_url,
             args.answer_model,
             args.answer_api_key,
+            service_mode=getattr(args, "answer_service", "auto"),
         )
         answer_model = ChatAnswerModel(
             answer_client,
@@ -180,6 +183,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
                 args.judge_base_url,
                 args.judge_model,
                 args.judge_api_key,
+                service_mode=getattr(args, "judge_service", "auto"),
             ),
             max_tokens=args.judge_max_tokens,
         )
@@ -703,6 +707,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--student-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--student-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--student-api-key", default="ollama")
+    parser.add_argument(
+        "--student-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--teacher-mode", choices=["llm", "off"], default="llm")
     parser.add_argument(
         "--teacher-privilege",
@@ -734,10 +743,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--teacher-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--teacher-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--teacher-api-key", default="ollama")
+    parser.add_argument(
+        "--teacher-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--policy-max-tokens", type=int, default=512)
     parser.add_argument("--answer-base-url", default="http://127.0.0.1:11435/v1")
     parser.add_argument("--answer-model", default="qwen3-vl-8b-instruct-ctx8k:latest")
     parser.add_argument("--answer-api-key", default="ollama")
+    parser.add_argument(
+        "--answer-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--answer-max-tokens", type=int, default=128)
     parser.add_argument("--answer-max-images", type=int, default=3)
     parser.add_argument("--raw-inspection", action="store_true")
@@ -747,6 +766,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--judge-base-url", default="http://127.0.0.1:11436/v1")
     parser.add_argument("--judge-model", default="gemma3-12b-it-q4km-judge:latest")
     parser.add_argument("--judge-api-key", default="ollama")
+    parser.add_argument(
+        "--judge-service",
+        choices=["auto", "local", "api"],
+        default="auto",
+    )
     parser.add_argument("--judge-max-tokens", type=int, default=192)
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args(argv)
