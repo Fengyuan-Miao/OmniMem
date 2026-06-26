@@ -16,7 +16,6 @@ class MemoryRecord:
     source_type: str
     summary: str = ""
     content: str = ""
-    ocr: str = ""
     raw_pointer: Optional[str] = None
     status: str = "active"
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -24,7 +23,7 @@ class MemoryRecord:
     def searchable_text(self) -> str:
         return " ".join(
             value
-            for value in [self.summary, self.content, self.ocr]
+            for value in [self.summary, self.content]
             if value
         )
 
@@ -42,7 +41,6 @@ class MemoryRecord:
             "source_type": self.source_type,
             "summary": self.summary,
             "content": self.content or None,
-            "ocr": self.ocr or None,
             "raw_pointer": self.raw_pointer,
             "status": self.status,
             "metadata": self.metadata,

@@ -310,7 +310,7 @@ def test_executor_composes_generic_tools_to_read_latest_user_image():
             modality="image",
             source_type="uploaded_image",
             summary="ICLR receipt",
-            ocr="$450",
+            content="registration total $450",
         ),
         MemoryRecord(
             memory_id="internal-text",
@@ -327,14 +327,14 @@ def test_executor_composes_generic_tools_to_read_latest_user_image():
         ToolAction("FILTER", {"field": "author", "op": "eq", "value": "user"}),
         ToolAction("SORT", {"field": "timestamp", "order": "desc"}),
         ToolAction("TOPK", {"k": 1}),
-        ToolAction("READ", {"fields": ["summary", "ocr", "timestamp"]}),
+        ToolAction("READ", {"fields": ["summary", "content", "timestamp"]}),
         ToolAction("STOP"),
     ]
     result = ToolExecutor().run(trace, "What was my last image?", HiddenMemoryStore(records))
     assert result.stopped is True
     assert result.final_memory_ids == ["internal-new"]
     assert result.evidence[0].fields["summary"] == "ICLR receipt"
-    assert result.evidence[0].fields["ocr"] == "$450"
+    assert result.evidence[0].fields["content"] == "registration total $450"
 
 
 def test_retrieve_operates_only_on_filtered_current_pool():

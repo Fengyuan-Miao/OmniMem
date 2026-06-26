@@ -1,0 +1,123 @@
+{
+  "output": "/home/miaofy/SimpleMem/OmniMem/data/hard_memory_samples/hard_memory_samples_500_memgallery_main.jsonl",
+  "target_size": 500,
+  "requested_quota": {
+    "Mem-Gallery": 300,
+    "MemEye": 120,
+    "LoCoMo": 80
+  },
+  "candidate_counts": {
+    "Mem-Gallery": 1711,
+    "LoCoMo": 1986,
+    "MemEye": 371
+  },
+  "selection_summary": {
+    "total": 500,
+    "by_dataset": {
+      "LoCoMo": 80,
+      "Mem-Gallery": 300,
+      "MemEye": 120
+    },
+    "by_domain": {
+      "LoCoMo/conv-26": 8,
+      "LoCoMo/conv-30": 5,
+      "LoCoMo/conv-41": 9,
+      "LoCoMo/conv-42": 8,
+      "LoCoMo/conv-43": 8,
+      "LoCoMo/conv-44": 9,
+      "LoCoMo/conv-47": 7,
+      "LoCoMo/conv-48": 10,
+      "LoCoMo/conv-49": 8,
+      "LoCoMo/conv-50": 8,
+      "Mem-Gallery/AI_Robotics_Automation_Future_Tech": 15,
+      "Mem-Gallery/Academic_Animal_Pet_Research_Life": 15,
+      "Mem-Gallery/Architecture_Art_Culture_Exhibition_Technology": 15,
+      "Mem-Gallery/Astronomy_Physics_Scientific_Experiments_Cosmology": 15,
+      "Mem-Gallery/Baking_Dessert_Daily_Life_Skill": 15,
+      "Mem-Gallery/Dog_Behavior_Research_Academic_Life": 15,
+      "Mem-Gallery/Education_Career_Research_Lifestyle": 15,
+      "Mem-Gallery/Entrepreneurship_Blockchain_Economics_Logistics_Nature": 15,
+      "Mem-Gallery/Fashion_Personal_Care_Lifestyle_Shopping": 15,
+      "Mem-Gallery/Global_Travel_Cultural_Sightseeing": 15,
+      "Mem-Gallery/Global_Travel_Sustainable_Fashion_Design": 15,
+      "Mem-Gallery/Home_Health_Lifestyle_Product": 15,
+      "Mem-Gallery/Home_Repair_Maintenance_Cleaning": 15,
+      "Mem-Gallery/Landscape_Travel_Architecture_Nature": 15,
+      "Mem-Gallery/Music_Dance_Theater_Performance_Learning": 15,
+      "Mem-Gallery/Nature_Economics_Programming_Student_Life": 15,
+      "Mem-Gallery/Parenting_Commuting_Hobbies_Travel_Gear": 15,
+      "Mem-Gallery/Python_Botany_AI_Student_Life": 15,
+      "Mem-Gallery/Real_Estate_Home_Decor_DIY_Lifestyle": 15,
+      "Mem-Gallery/Technology_Ethics_Future_Society": 15,
+      "MemEye/Brand_Memory_Test_Open": 15,
+      "MemEye/Card_Playlog_Test_Open": 15,
+      "MemEye/Cartoon_Entertainment_Companion_Open": 15,
+      "MemEye/Home_Renovation_Interior_Design_Open": 15,
+      "MemEye/Multi-Scene_Visual_Case_Archive_Assistant_Open": 15,
+      "MemEye/Outdoor_Navigation_Route_Memory_Assistant_Open": 15,
+      "MemEye/Personal_Health_Dashboard_Assistant_Open": 15,
+      "MemEye/Social_Chat_Memory_Test_Open": 15
+    },
+    "by_point": {
+      "TR": 24,
+      "MR": 34,
+      "VS": 71,
+      "CD": 14,
+      "FR": 18,
+      "VR": 61,
+      "TTL": 71,
+      "AR": 3,
+      "KR": 4,
+      "[['X3'], ['Y2']]": 30,
+      "[['X1'], ['Y2']]": 14,
+      "[['X4'], ['Y1']]": 1,
+      "[['X2'], ['Y2']]": 17,
+      "[['X4'], ['Y2']]": 28,
+      "[['X4'], ['Y3']]": 8,
+      "[['X3'], ['Y1']]": 7,
+      "[['X2'], ['Y1']]": 9,
+      "[['X3'], ['Y3']]": 4,
+      "[['X2'], ['Y3']]": 1,
+      "[['X1'], ['Y1']]": 1
+    },
+    "by_category": {
+      "3": 17,
+      "1": 20,
+      "5": 14,
+      "4": 11,
+      "2": 18
+    },
+    "query_signal_counts": {
+      "reasoning": 155,
+      "temporal": 109,
+      "aggregation": 148,
+      "comparison": 99,
+      "visual_detail": 187
+    },
+    "samples_with_prior_wrong": 162,
+    "difficulty_score": {
+      "min": 5.316666666666666,
+      "max": 58.575,
+      "avg": 12.859566666666668
+    }
+  },
+  "difficulty_policy": {
+    "primary_sources": [
+      "Mem-Gallery is the main distribution",
+      "MemEye is used as hard multimodal/visual-memory supplement",
+      "LoCoMo is used as pure text long-term memory supplement",
+      "historical prediction failures and evidence misses when available",
+      "multi-support and cross-session evidence",
+      "temporal/comparison/aggregation/reasoning/visual-detail query signals",
+      "benchmark category or point weights",
+      "long-horizon LoCoMo evidence sessions"
+    ],
+    "no_model_calls": true
+  },
+  "source_paths": {
+    "memgallery_dir": "/home/miaofy/SimpleMem/benchmark/Mem-Gallery",
+    "memeye_dir": "/home/miaofy/SimpleMem/benchmark/MemEye/data",
+    "locomo_path": "/home/miaofy/SimpleMem/benchmark/LoCoMo/data/locomo10.json",
+    "runs_dir": "/home/miaofy/SimpleMem/OmniMem/runs"
+  }
+}

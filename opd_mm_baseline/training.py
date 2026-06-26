@@ -151,7 +151,6 @@ class OnPolicyDistiller:
                     "fields": [
                         "summary",
                         "content",
-                        "ocr",
                         "timestamp",
                         "turn_id",
                         "author",

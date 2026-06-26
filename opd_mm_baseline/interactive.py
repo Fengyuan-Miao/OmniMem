@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Protocol
 
@@ -48,7 +49,6 @@ PUBLIC_IMAGE_ID_PATTERN = re.compile(r"\bD\d+:IMG_\d+\b")
 DEFAULT_READ_FIELDS = [
     "summary",
     "content",
-    "ocr",
     "timestamp",
     "session_date",
     "turn_id",
@@ -79,6 +79,17 @@ def _actions_signature(actions: List[ToolAction]) -> str:
     )
 
 
+def _evidence_signature(evidence: List[EvidenceItem]) -> tuple[Any, ...]:
+    return tuple(
+        (
+            item.memory_id,
+            item.source,
+            json.dumps(item.fields, sort_keys=True, default=str),
+        )
+        for item in evidence
+    )
+
+
 def _clip_text(value: Any, limit: int = 240) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -100,7 +111,7 @@ def build_interactive_schema(
         "SORT(field=timestamp|turn_id|score, order=asc|desc)",
         "TOPK(k=positive integer)",
         "EXPAND_NEIGHBORS(window=1|2|3)",
-        "READ(fields=[summary|content|ocr|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])",
+        "READ(fields=[summary|content|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])",
     ]
     if allow_inspect_raw:
         lines.extend(
@@ -432,7 +443,6 @@ def _compact_prompt_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
         "summary",
         "visual_observation",
         "linked_text_context",
-        "ocr",
         "image_label",
         "timestamp",
         "session_date",
@@ -446,7 +456,6 @@ def _compact_prompt_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
         "summary": 180,
         "visual_observation": 220,
         "linked_text_context": 180,
-        "ocr": 120,
         "image_label": 80,
     }
     for key in preferred:
@@ -1564,8 +1573,8 @@ def build_compact_planner_prompt(
             'current feedback","next_tool":"RETRIEVE","expected_gain":"find '
             'and read a focused candidate pool","actions":[{"tool":'
             '"RETRIEVE","method":"vision","top_k":5,"scope":"all"},'
-            '{"tool":"READ","fields":["summary","content","ocr",'
-            '"timestamp","session_date","turn_id","author","modality",'
+            '{"tool":"READ","fields":["summary","content","timestamp",'
+            '"session_date","turn_id","author","modality",'
             '"source_type","raw_pointer"]}]}]}'
         )
     )
@@ -2108,6 +2117,9 @@ class InteractiveSearchResult:
     answer_validation: Optional[AnswerValidationResult] = None
     answer_validator_calls: int = 0
     failure_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+    validation_cache_hits: int = 0
+    planner_seconds: float = 0.0
+    answer_validator_seconds: float = 0.0
 
     def sft_examples(
         self,
@@ -2357,6 +2369,9 @@ class InteractiveTeacherSearch:
         finished: List[SearchNode] = []
         candidates_evaluated = 0
         failure_diagnostics: List[Dict[str, Any]] = []
+        validation_cache_hits = 0
+        planner_seconds = 0.0
+        answer_validator_seconds = 0.0
         planner_calls_before = getattr(self.planner, "calls", 0)
         answer_validator_calls_before = getattr(
             self.answer_validator,
@@ -2377,6 +2392,7 @@ class InteractiveTeacherSearch:
                     else None
                 )
                 try:
+                    planner_started = time.perf_counter()
                     chunks = self.planner.propose(
                         query=query,
                         history=node.session.history,
@@ -2384,6 +2400,7 @@ class InteractiveTeacherSearch:
                         candidate_count=self.candidates_per_node,
                         privileged_feedback=feedback,
                     )
+                    planner_seconds += time.perf_counter() - planner_started
                     planner_raw = str(
                         getattr(self.planner, "last_raw_response", "")
                     )
@@ -2402,6 +2419,8 @@ class InteractiveTeacherSearch:
                         )
                     )
                 except Exception:
+                    if "planner_started" in locals():
+                        planner_seconds += time.perf_counter() - planner_started
                     chunks = fallback_action_chunks(
                         observation,
                         self.validator,
@@ -2420,14 +2439,26 @@ class InteractiveTeacherSearch:
                         observation_after = child_session.execute_chunk(chunk)
                     except Exception:
                         continue
-                    verification, answer_validation = (
-                        self._validate_candidate_evidence(
-                            query,
-                            gold_answer,
-                            child_session.evidence,
-                            question_image,
+                    evidence_changed = _evidence_signature(
+                        child_session.evidence
+                    ) != _evidence_signature(node.session.evidence)
+                    if evidence_changed:
+                        validation_started = time.perf_counter()
+                        verification, answer_validation = (
+                            self._validate_candidate_evidence(
+                                query,
+                                gold_answer,
+                                child_session.evidence,
+                                question_image,
+                            )
                         )
-                    )
+                        answer_validator_seconds += (
+                            time.perf_counter() - validation_started
+                        )
+                    else:
+                        validation_cache_hits += 1
+                        verification = node.verification
+                        answer_validation = node.answer_validation
                     if (
                         answer_validation is not None
                         and not answer_validation.correct
@@ -2594,4 +2625,7 @@ class InteractiveTeacherSearch:
                 - answer_validator_calls_before
             ),
             failure_diagnostics=failure_diagnostics,
+            validation_cache_hits=validation_cache_hits,
+            planner_seconds=planner_seconds,
+            answer_validator_seconds=answer_validator_seconds,
         )

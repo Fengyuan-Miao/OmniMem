@@ -42,7 +42,6 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "memeye_opd_interactive"
 READ_FIELDS = [
     "summary",
     "content",
-    "ocr",
     "timestamp",
     "session_date",
     "turn_id",

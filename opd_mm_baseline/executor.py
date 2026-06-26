@@ -255,7 +255,7 @@ class ToolExecutor:
                 continue
             text = " ".join(
                 value
-                for value in [memory.summary, memory.content, memory.ocr]
+                for value in [memory.summary, memory.content]
                 if value
             ).strip()
             if not text:
