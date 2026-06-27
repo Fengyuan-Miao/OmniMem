@@ -38,6 +38,13 @@ except ImportError:
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "opd_online_train"
 DEFAULT_TRAIN_MODEL = "/home/miaofy/models/Qwen3-VL-4B-Thinking"
+DEFAULT_BENCHMARK_DIR = PROJECT_ROOT.parent / "benchmark"
+DEFAULT_HARD_SAMPLE_MANIFEST = (
+    PROJECT_ROOT
+    / "data"
+    / "hard_memory_samples"
+    / "hard_memory_samples_500_memgallery_main.jsonl"
+)
 
 
 def count_jsonl(path: Path) -> int:
@@ -500,6 +507,94 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Collect online data but skip the training/update step.",
     )
     parser.add_argument("--online-samples-per-rank", type=int, default=1)
+    parser.add_argument(
+        "--stream-teacher-source",
+        choices=["local", "service"],
+        default="local",
+        help=(
+            "Planner source used for online teacher correction in streaming "
+            "mode. 'local' uses the live trainable model; 'service' keeps "
+            "the teacher_search built by make_components()."
+        ),
+    )
+    parser.add_argument(
+        "--worker-progress-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory for rank-local streaming heartbeats. Useful "
+            "for diagnosing slow first rollouts before distributed gather."
+        ),
+    )
+    parser.add_argument(
+        "--external-call-timeout",
+        type=int,
+        default=180,
+        help=(
+            "HTTP timeout in seconds for OpenAI-compatible planner, answer, "
+            "judge, and raw-inspection calls."
+        ),
+    )
+    parser.add_argument(
+        "--sample-timeout-seconds",
+        type=int,
+        default=1500,
+        help=(
+            "Hard timeout for one online sample on each rank. Timed-out "
+            "samples are logged as failed rollouts so other ranks can reach "
+            "distributed gather instead of waiting for NCCL timeout. Use 0 "
+            "to disable."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-timeout-minutes",
+        type=int,
+        default=90,
+        help=(
+            "Torch distributed process-group timeout. Keep this larger than "
+            "--sample-timeout-seconds plus expected gather/training time."
+        ),
+    )
+    parser.add_argument(
+        "--hard-sample-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional mixed hard-sample JSONL manifest. When set, streaming "
+            "training reads OPDSamples from this manifest instead of iterating "
+            "Mem-Gallery scenario files."
+        ),
+    )
+    parser.add_argument(
+        "--hard-sample-datasets",
+        nargs="*",
+        default=None,
+        help=(
+            "Dataset names to keep from --hard-sample-manifest, for example "
+            "'Mem-Gallery LoCoMo'."
+        ),
+    )
+    parser.add_argument(
+        "--hard-sample-max-samples",
+        type=int,
+        default=None,
+        help="Optional cap after filtering and train/val split.",
+    )
+    parser.add_argument(
+        "--memeye-dir",
+        type=Path,
+        default=DEFAULT_BENCHMARK_DIR / "MemEye" / "data",
+        help=(
+            "MemEye data root used only when a hard-sample manifest contains "
+            "MemEye rows."
+        ),
+    )
+    parser.add_argument(
+        "--locomo-path",
+        type=Path,
+        default=DEFAULT_BENCHMARK_DIR / "LoCoMo" / "data" / "locomo10.json",
+        help="LoCoMo locomo10.json path for hard-sample manifest rows.",
+    )
     parser.add_argument(
         "--training-mode",
         choices=["full", "lora"],

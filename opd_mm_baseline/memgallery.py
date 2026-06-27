@@ -40,6 +40,12 @@ def observed_at(date_value: str, global_turn: int, offset: int = 0) -> str:
         return f"order:{global_turn:06d}:{offset:02d}"
 
 
+def profile_user_name(data: Dict[str, Any]) -> str:
+    profile = data.get("character_profile") or {}
+    name = str(profile.get("name") or "").strip()
+    return name or "User"
+
+
 def scenario_records(
     data: Dict[str, Any],
     data_dir: Path,
@@ -47,6 +53,7 @@ def scenario_records(
     max_turns: Optional[int] = None,
 ) -> List[MemoryRecord]:
     records: List[MemoryRecord] = []
+    user_name = profile_user_name(data)
     sessions = data.get("multi_session_dialogues") or []
     if max_sessions is not None:
         sessions = sessions[: max(0, max_sessions)]
@@ -72,7 +79,7 @@ def scenario_records(
             turn_content = "\n".join(
                 line
                 for line in [
-                    f"User: {user_text}" if user_text else "",
+                    f"{user_name}: {user_text}" if user_text else "",
                     f"Assistant: {assistant_text}" if assistant_text else "",
                 ]
                 if line
@@ -83,12 +90,12 @@ def scenario_records(
                         memory_id=f"{turn_id}:turn",
                         turn_id=turn_id,
                         timestamp=observed_at(date_value, global_turn, 0),
-                        author="user" if user_text else "assistant",
+                        author=user_name if user_text else "assistant",
                         modality="text",
                         source_type="conversation",
                         summary=user_text or assistant_text,
                         content=turn_content,
-                        metadata=dict(common_metadata),
+                        metadata={**common_metadata, "profile_name": user_name},
                     )
                 )
             image_ids = turn.get("image_id") or []
@@ -123,7 +130,7 @@ def scenario_records(
                             global_turn,
                             1 + image_index,
                         ),
-                        author="user",
+                        author=user_name,
                         modality="image",
                         source_type="uploaded_image",
                         summary=caption,

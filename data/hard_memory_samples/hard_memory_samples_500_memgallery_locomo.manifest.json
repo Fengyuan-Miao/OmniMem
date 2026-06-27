@@ -1,0 +1,103 @@
+{
+  "output": "/home/miaofy/SimpleMem/OmniMem/data/hard_memory_samples/hard_memory_samples_500_memgallery_locomo.jsonl",
+  "target_size": 500,
+  "requested_quota": {
+    "Mem-Gallery": 420,
+    "LoCoMo": 80,
+    "MemEye": 0
+  },
+  "candidate_counts": {
+    "Mem-Gallery": 1711,
+    "LoCoMo": 1986,
+    "MemEye": 371
+  },
+  "selection_summary": {
+    "total": 500,
+    "by_dataset": {
+      "LoCoMo": 80,
+      "Mem-Gallery": 420
+    },
+    "by_domain": {
+      "LoCoMo/conv-26": 8,
+      "LoCoMo/conv-30": 5,
+      "LoCoMo/conv-41": 9,
+      "LoCoMo/conv-42": 8,
+      "LoCoMo/conv-43": 8,
+      "LoCoMo/conv-44": 9,
+      "LoCoMo/conv-47": 7,
+      "LoCoMo/conv-48": 10,
+      "LoCoMo/conv-49": 8,
+      "LoCoMo/conv-50": 8,
+      "Mem-Gallery/AI_Robotics_Automation_Future_Tech": 21,
+      "Mem-Gallery/Academic_Animal_Pet_Research_Life": 21,
+      "Mem-Gallery/Architecture_Art_Culture_Exhibition_Technology": 21,
+      "Mem-Gallery/Astronomy_Physics_Scientific_Experiments_Cosmology": 21,
+      "Mem-Gallery/Baking_Dessert_Daily_Life_Skill": 21,
+      "Mem-Gallery/Dog_Behavior_Research_Academic_Life": 21,
+      "Mem-Gallery/Education_Career_Research_Lifestyle": 21,
+      "Mem-Gallery/Entrepreneurship_Blockchain_Economics_Logistics_Nature": 21,
+      "Mem-Gallery/Fashion_Personal_Care_Lifestyle_Shopping": 21,
+      "Mem-Gallery/Global_Travel_Cultural_Sightseeing": 21,
+      "Mem-Gallery/Global_Travel_Sustainable_Fashion_Design": 21,
+      "Mem-Gallery/Home_Health_Lifestyle_Product": 21,
+      "Mem-Gallery/Home_Repair_Maintenance_Cleaning": 21,
+      "Mem-Gallery/Landscape_Travel_Architecture_Nature": 21,
+      "Mem-Gallery/Music_Dance_Theater_Performance_Learning": 21,
+      "Mem-Gallery/Nature_Economics_Programming_Student_Life": 21,
+      "Mem-Gallery/Parenting_Commuting_Hobbies_Travel_Gear": 21,
+      "Mem-Gallery/Python_Botany_AI_Student_Life": 21,
+      "Mem-Gallery/Real_Estate_Home_Decor_DIY_Lifestyle": 21,
+      "Mem-Gallery/Technology_Ethics_Future_Society": 21
+    },
+    "by_point": {
+      "TR": 25,
+      "MR": 50,
+      "VS": 89,
+      "CD": 17,
+      "FR": 28,
+      "VR": 76,
+      "KR": 5,
+      "TTL": 127,
+      "AR": 3
+    },
+    "by_category": {
+      "3": 17,
+      "1": 20,
+      "5": 14,
+      "4": 11,
+      "2": 18
+    },
+    "query_signal_counts": {
+      "reasoning": 134,
+      "temporal": 76,
+      "aggregation": 131,
+      "comparison": 86,
+      "visual_detail": 230
+    },
+    "samples_with_prior_wrong": 90,
+    "difficulty_score": {
+      "min": 4.95,
+      "max": 58.575,
+      "avg": 10.684666666666667
+    }
+  },
+  "difficulty_policy": {
+    "primary_sources": [
+      "Mem-Gallery is the main distribution",
+      "MemEye is used as hard multimodal/visual-memory supplement",
+      "LoCoMo is used as pure text long-term memory supplement",
+      "historical prediction failures and evidence misses when available",
+      "multi-support and cross-session evidence",
+      "temporal/comparison/aggregation/reasoning/visual-detail query signals",
+      "benchmark category or point weights",
+      "long-horizon LoCoMo evidence sessions"
+    ],
+    "no_model_calls": true
+  },
+  "source_paths": {
+    "memgallery_dir": "/home/miaofy/SimpleMem/benchmark/Mem-Gallery",
+    "memeye_dir": "/home/miaofy/SimpleMem/benchmark/MemEye/data",
+    "locomo_path": "/home/miaofy/SimpleMem/benchmark/LoCoMo/data/locomo10.json",
+    "runs_dir": "/home/miaofy/SimpleMem/OmniMem/runs"
+  }
+}

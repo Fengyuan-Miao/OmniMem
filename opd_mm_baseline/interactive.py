@@ -90,6 +90,10 @@ def _evidence_signature(evidence: List[EvidenceItem]) -> tuple[Any, ...]:
     )
 
 
+def _pool_signature(pool: List[PoolItem]) -> tuple[Any, ...]:
+    return tuple((item.memory.memory_id, round(float(item.score), 6)) for item in pool)
+
+
 def _clip_text(value: Any, limit: int = 240) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -205,7 +209,7 @@ class InteractiveActionValidator:
             return self.validate([])
 
         repaired: List[ToolAction] = []
-        for value in values:
+        for value in list(values)[: self.max_chunk_actions]:
             repaired.append(self._repair_action(value))
         return self.validate(repaired)
 
@@ -1601,6 +1605,9 @@ Constraints:
 {retrieve_guidance}
 - If candidates exist but evidence is empty, read or inspect them instead of
   repeating the same retrieval.
+- If the candidate pool changed but evidence.new is 0, the new candidates have
+  not been used as evidence yet. Prefer READ; if surrounding dialogue is needed,
+  use EXPAND_NEIGHBORS then READ.
 - Do not STOP while relevant candidates remain unread or uninspected.
 - No memory IDs or file paths.
 - If fb says visual/image gap, use INSPECT_RAW.
@@ -1621,6 +1628,8 @@ Answer-model feedback:
   the attempt is not a repeat of last_retrieval. If it is EXPAND_NEIGHBORS,
   recover surrounding turns before reading. If it names STOP, stop only when
   fb says the evidence is answerable.
+- If fb.failure_diagnostic.failure_type is unread_candidate_pool, use READ
+  now; do not retrieve again before reading the current pool.
 - Respect avoid_action as a warning about a repeated or unhelpful move.
 - Treat repeated failure as a signal to switch tools. For example, after a
   failed semantic search try bm25/vision/hybrid with a focused query; after
@@ -1642,6 +1651,13 @@ Planning guidance:
   retrieve+read for a new pool, expand+read for surrounding context,
   filter/sort+read for narrowing or temporal questions, inspect_raw for
   visual verification. Keep the chunk short and purposeful.
+- Use FILTER when the current pool already contains plausible candidates but
+  must be narrowed by author/person, modality, source_type, date/session, or a
+  distinctive text value; usually follow FILTER with READ.
+- Use SORT for before/after, latest/earliest, timeline, first/last, or other
+  chronology questions; sort by timestamp/turn_id, optionally TOPK, then READ.
+- Use TOPK after FILTER or SORT when the pool is broad and only the strongest
+  or temporally relevant candidates should be read.
 - Candidate metadata and executable actions must agree. If next_tool says a
   more targeted search or broader context is needed, the action parameters
   should visibly implement that change.
@@ -2340,6 +2356,49 @@ class InteractiveTeacherSearch:
             answer_validation,
         )
 
+    def _unread_candidate_pool_verification(
+        self,
+        session: ExecutorSession,
+    ) -> VerificationResult:
+        """Executor-level feedback when retrieval changed pool but not evidence."""
+        has_visual_candidates = any(
+            item.memory.modality == "image" for item in session.pool[:8]
+        )
+        return VerificationResult(
+            answerable=False,
+            relevance=0.0,
+            completeness=0.0,
+            redundancy=self._evidence_redundancy(session.evidence),
+            reason=(
+                "The candidate pool changed, but no new evidence was read. "
+                "The answer validator cannot assess newly retrieved candidates "
+                "until READ or INSPECT_RAW adds evidence."
+            ),
+            diagnostic={
+                "failure_type": "unread_candidate_pool",
+                "evidence_gap": (
+                    "New candidate memories are available but have not been "
+                    "converted into answer evidence."
+                ),
+                "recommended_change": (
+                    "Read the current candidate pool before another retrieval. "
+                    "If the relevant fact may be in nearby dialogue context, "
+                    "expand neighbors and then read."
+                ),
+                "recommended_tool": "READ",
+                "needs_text_evidence": True,
+                "needs_visual_evidence": bool(
+                    has_visual_candidates
+                    and self.validator.allow_inspect_raw
+                    and self.raw_inspector is not None
+                ),
+                "needs_neighbor_context": False,
+                "avoid_action": (
+                    "Another RETRIEVE before reading the current candidate pool."
+                ),
+            },
+        )
+
     def search(
         self,
         query: str,
@@ -2418,7 +2477,7 @@ class InteractiveTeacherSearch:
                             {},
                         )
                     )
-                except Exception:
+                except Exception as exc:
                     if "planner_started" in locals():
                         planner_seconds += time.perf_counter() - planner_started
                     chunks = fallback_action_chunks(
@@ -2428,7 +2487,9 @@ class InteractiveTeacherSearch:
                     )
                     if not chunks:
                         chunks = [[ToolAction("STOP")]]
-                    planner_raw = ""
+                    planner_raw = (
+                        f"[planner_error] {type(exc).__name__}: {exc}"
+                    )
                     candidate_sources = {}
                     candidate_rationales = {}
                 for chunk in chunks:
@@ -2442,6 +2503,9 @@ class InteractiveTeacherSearch:
                     evidence_changed = _evidence_signature(
                         child_session.evidence
                     ) != _evidence_signature(node.session.evidence)
+                    pool_changed = _pool_signature(
+                        child_session.pool
+                    ) != _pool_signature(node.session.pool)
                     if evidence_changed:
                         validation_started = time.perf_counter()
                         verification, answer_validation = (
@@ -2455,6 +2519,16 @@ class InteractiveTeacherSearch:
                         answer_validator_seconds += (
                             time.perf_counter() - validation_started
                         )
+                    elif (
+                        pool_changed
+                        and child_session.pool_observable
+                        and child_session.pool
+                    ):
+                        validation_cache_hits += 1
+                        verification = self._unread_candidate_pool_verification(
+                            child_session
+                        )
+                        answer_validation = node.answer_validation
                     else:
                         validation_cache_hits += 1
                         verification = node.verification

@@ -52,6 +52,7 @@ def _make_chat_client(
     model: str,
     api_key: str,
     service_mode: str = "auto",
+    timeout: int = 180,
     device: str,
     dtype: str,
     hf_cache: Dict[tuple[str, str, str], HFQwenVLClient],
@@ -65,6 +66,7 @@ def _make_chat_client(
         base_url,
         model,
         api_key,
+        timeout=timeout,
         service_mode=service_mode,
     )
 
@@ -83,6 +85,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             model=args.student_model,
             api_key=args.student_api_key,
             service_mode=getattr(args, "student_service", "auto"),
+            timeout=getattr(args, "external_call_timeout", 180),
             device=args.student_device,
             dtype=args.student_dtype,
             hf_cache=hf_cache,
@@ -100,6 +103,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             model=args.teacher_model,
             api_key=args.teacher_api_key,
             service_mode=getattr(args, "teacher_service", "auto"),
+            timeout=getattr(args, "external_call_timeout", 180),
             device=args.teacher_device,
             dtype=args.teacher_dtype,
             hf_cache=hf_cache,
@@ -121,6 +125,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.answer_base_url,
             args.answer_model,
             args.answer_api_key,
+            timeout=getattr(args, "external_call_timeout", 180),
             service_mode=getattr(args, "answer_service", "auto"),
         )
     answer_model = ChatAnswerModel(
@@ -138,6 +143,7 @@ def make_components(args: argparse.Namespace) -> Dict[str, Any]:
             args.judge_base_url,
             args.judge_model,
             args.judge_api_key,
+            timeout=getattr(args, "external_call_timeout", 180),
             service_mode=getattr(args, "judge_service", "auto"),
         ),
         max_tokens=args.judge_max_tokens,

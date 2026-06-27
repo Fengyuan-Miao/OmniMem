@@ -18,17 +18,23 @@ import copy
 import hashlib
 import json
 import os
+import signal
 import time
 from collections import Counter, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin, DistributedDataParallelKwargs
+from accelerate.utils import (
+    DeepSpeedPlugin,
+    DistributedDataParallelKwargs,
+    InitProcessGroupKwargs,
+)
 from accelerate.utils import gather_object, set_seed
 from peft import (
     LoraConfig,
@@ -45,20 +51,38 @@ from omnimem.config import require_memgallery_dir
 
 from .build_opd_dataset import split_name
 from .clients import extract_json_array
+from .hard_sample_teacher_eval import (
+    DEFAULT_MANIFEST as DEFAULT_HARD_SAMPLE_MANIFEST,
+    HardSampleResolver,
+    iter_jsonl,
+)
 from .interactive import (
+    AnswerValidationResult,
     ChatInteractivePlanner,
     InteractiveActionValidator,
+    InteractiveTeacherSearch,
+    _actions_signature,
+    _extract_candidates_object,
+    build_compact_planner_prompt,
     build_simple_student_policy_prompt,
 )
 from .memgallery import build_scenario_store, scenario_samples
 from .memgallery_online_pipeline import make_components
-from .memgallery_pipeline import now_stamp, resolve_scenarios
+from .memgallery_pipeline import ProgressBar, now_stamp, resolve_scenarios
 from .models import OPDSample, ToolAction
 from .online import OnlineCorrection, OnlineSampleResult, OnlineSelfDistiller
 
 
 STUDENT_ADAPTER = "student"
 TEACHER_ADAPTER = "teacher"
+
+
+def _append_progress_event(path: Optional[Path], event: Dict[str, Any]) -> None:
+    if path is None:
+        return
+    row = {"time": time.time(), **event}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def state_key(prompt: str) -> str:
@@ -90,6 +114,358 @@ def minimal_wandb_settings() -> Any:
         save_code=False,
         console="off",
     )
+
+
+def _require_env_api_keys(args: argparse.Namespace) -> None:
+    """Fail early when API clients are configured with missing env keys."""
+    checks = [
+        ("answer", getattr(args, "answer_api_key", "")),
+        ("judge", getattr(args, "judge_api_key", "")),
+    ]
+    for label, value in checks:
+        text = str(value or "")
+        if not text.startswith("env:"):
+            continue
+        env_name = text.split(":", 1)[1].strip()
+        if not env_name or not os.environ.get(env_name):
+            raise RuntimeError(
+                f"{label} API key is configured as {text!r}, "
+                f"but environment variable {env_name!r} is not set."
+            )
+
+
+def _worker_progress_path(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+) -> Optional[Path]:
+    value = getattr(args, "worker_progress_dir", None)
+    if not value:
+        return None
+    path = Path(value).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path / f"worker_progress_rank{accelerator.process_index}.jsonl"
+
+
+class SampleTimeoutError(TimeoutError):
+    pass
+
+
+class sample_timeout:
+    def __init__(self, seconds: int):
+        self.seconds = max(0, int(seconds))
+        self._previous_handler: Any = None
+        self._active = False
+
+    def __enter__(self) -> "sample_timeout":
+        if self.seconds <= 0:
+            return self
+        self._previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _handler(_signum: int, _frame: Any) -> None:
+            raise SampleTimeoutError(
+                f"sample exceeded {self.seconds}s timeout"
+            )
+
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(self.seconds)
+        self._active = True
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self._active:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self._previous_handler)
+        return False
+
+
+def _timeout_sample_result(
+    sample: OPDSample,
+    *,
+    error: str,
+) -> OnlineSampleResult:
+    validation = AnswerValidationResult(
+        correct=False,
+        score=0.0,
+        prediction="",
+        error=error,
+        reason="Online sample collection timed out.",
+        diagnostic={
+            "failure_type": "sample_timeout",
+            "evidence_gap": "External-service collection did not finish.",
+        },
+    )
+    return OnlineSampleResult(
+        sample_id=sample.sample_id,
+        student_actions=[],
+        student_evidence_sufficiency=validation,
+        student_answer_validation=validation,
+        corrections=[],
+        student_planner_calls=0,
+        teacher_attempts=[
+            {
+                "trigger": "sample_timeout",
+                "error": error,
+            }
+        ],
+    )
+
+
+def _safe_len(value: Any) -> Optional[int]:
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def _summarize_external_call(
+    service: str,
+    method: str,
+    args: tuple[Any, ...],
+    kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    query = kwargs.get("query")
+    if query is None and args and isinstance(args[0], str):
+        query = args[0]
+    if query:
+        summary["query"] = str(query)[:200]
+    if "candidate_count" in kwargs:
+        summary["candidate_count"] = kwargs.get("candidate_count")
+    history = kwargs.get("history")
+    if history is not None:
+        summary["history_len"] = _safe_len(history)
+    evidence = kwargs.get("evidence")
+    if evidence is None:
+        if method in {"evaluate", "answer", "assess_evidence"} and len(args) >= 3:
+            evidence = args[2]
+    if evidence is not None:
+        summary["evidence_count"] = _safe_len(evidence)
+    memory_store = kwargs.get("memory_store")
+    if memory_store is None and method == "search" and len(args) >= 3:
+        memory_store = args[2]
+    if memory_store is not None:
+        summary["memory_count"] = _safe_len(memory_store)
+    question_image = kwargs.get("question_image")
+    if question_image is not None:
+        summary["has_question_image"] = bool(question_image)
+    if method == "inspect":
+        image_path = kwargs.get("image_path") or (args[0] if args else "")
+        summary["image"] = Path(str(image_path)).name if image_path else ""
+    return summary
+
+
+def _summarize_external_result(result: Any) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    if result is None:
+        summary["result_type"] = "None"
+        return summary
+    summary["result_type"] = type(result).__name__
+    if isinstance(result, str):
+        summary["result_chars"] = len(result)
+        return summary
+    if isinstance(result, (list, tuple)):
+        summary["result_len"] = len(result)
+        return summary
+    if isinstance(result, dict):
+        summary["result_keys"] = list(result.keys())[:12]
+        for key in ("answerable", "correct", "score", "failure_type"):
+            if key in result:
+                summary[key] = result[key]
+        return summary
+    for attr in ("correct", "score", "answerable"):
+        if hasattr(result, attr):
+            try:
+                summary[attr] = getattr(result, attr)
+            except Exception:
+                pass
+    if hasattr(result, "actions"):
+        summary["actions_len"] = _safe_len(getattr(result, "actions"))
+    if hasattr(result, "decisions"):
+        summary["decisions_len"] = _safe_len(getattr(result, "decisions"))
+    if hasattr(result, "answer_validation"):
+        validation = getattr(result, "answer_validation", None)
+        if validation is not None:
+            summary["answer_correct"] = getattr(validation, "correct", None)
+            summary["answer_score"] = getattr(validation, "score", None)
+            summary["answer_error"] = str(getattr(validation, "error", "") or "")[:200]
+    return summary
+
+
+class _HeartbeatProxy:
+    """Log start/end/error around selected external-service methods."""
+
+    def __init__(
+        self,
+        target: Any,
+        *,
+        name: str,
+        methods: Iterable[str],
+        progress_path: Optional[Path],
+        rank: int,
+    ):
+        self._target = target
+        self._name = name
+        self._methods = set(methods)
+        self._progress_path = progress_path
+        self._rank = rank
+        self._call_id = 0
+        self._heartbeat_wrapped = True
+
+    def __getattr__(self, item: str) -> Any:
+        value = getattr(self._target, item)
+        if item not in self._methods or not callable(value):
+            return value
+
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            self._call_id += 1
+            call_id = self._call_id
+            started = time.perf_counter()
+            _append_progress_event(
+                self._progress_path,
+                {
+                    "event": "external_call_start",
+                    "rank": self._rank,
+                    "service": self._name,
+                    "method": item,
+                    "call_id": call_id,
+                    **_summarize_external_call(
+                        self._name,
+                        item,
+                        args,
+                        kwargs,
+                    ),
+                },
+            )
+            try:
+                result = value(*args, **kwargs)
+            except Exception as exc:
+                _append_progress_event(
+                    self._progress_path,
+                    {
+                        "event": "external_call_error",
+                        "rank": self._rank,
+                        "service": self._name,
+                        "method": item,
+                        "call_id": call_id,
+                        "elapsed_s": round(time.perf_counter() - started, 3),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:500],
+                    },
+                )
+                raise
+            _append_progress_event(
+                self._progress_path,
+                {
+                    "event": "external_call_end",
+                    "rank": self._rank,
+                    "service": self._name,
+                    "method": item,
+                    "call_id": call_id,
+                    "elapsed_s": round(time.perf_counter() - started, 3),
+                    **_summarize_external_result(result),
+                },
+            )
+            return result
+
+        return _wrapped
+
+
+def _heartbeat_proxy(
+    target: Any,
+    *,
+    name: str,
+    methods: Iterable[str],
+    progress_path: Optional[Path],
+    rank: int,
+) -> Any:
+    if target is None or getattr(target, "_heartbeat_wrapped", False):
+        return target
+    return _HeartbeatProxy(
+        target,
+        name=name,
+        methods=methods,
+        progress_path=progress_path,
+        rank=rank,
+    )
+
+
+def _install_external_call_heartbeats(
+    components: Dict[str, Any],
+    *,
+    progress_path: Optional[Path],
+    rank: int,
+) -> None:
+    answer_model = _heartbeat_proxy(
+        components.get("answer_model"),
+        name="answer_model",
+        methods=("answer", "assess_evidence"),
+        progress_path=progress_path,
+        rank=rank,
+    )
+    judge = _heartbeat_proxy(
+        components.get("judge"),
+        name="judge",
+        methods=("evaluate", "diagnose_failure"),
+        progress_path=progress_path,
+        rank=rank,
+    )
+    raw_inspector = _heartbeat_proxy(
+        components.get("raw_inspector"),
+        name="raw_inspector",
+        methods=("inspect",),
+        progress_path=progress_path,
+        rank=rank,
+    )
+    answer_validator_target = components.get("answer_validator")
+    if answer_validator_target is not None:
+        if answer_model is not None and hasattr(answer_validator_target, "answer_model"):
+            answer_validator_target.answer_model = answer_model
+        if judge is not None and hasattr(answer_validator_target, "judge"):
+            answer_validator_target.judge = judge
+    answer_validator = _heartbeat_proxy(
+        answer_validator_target,
+        name="answer_validator",
+        methods=("evaluate",),
+        progress_path=progress_path,
+        rank=rank,
+    )
+
+    teacher_search_target = components.get("teacher_search")
+    if teacher_search_target is not None:
+        planner = getattr(teacher_search_target, "planner", None)
+        if planner is not None:
+            teacher_search_target.planner = _heartbeat_proxy(
+                planner,
+                name="teacher_planner",
+                methods=("propose",),
+                progress_path=progress_path,
+                rank=rank,
+            )
+        if answer_validator is not None and hasattr(
+            teacher_search_target,
+            "answer_validator",
+        ):
+            teacher_search_target.answer_validator = answer_validator
+        if raw_inspector is not None and hasattr(
+            teacher_search_target,
+            "raw_inspector",
+        ):
+            teacher_search_target.raw_inspector = raw_inspector
+        teacher_search = _heartbeat_proxy(
+            teacher_search_target,
+            name="teacher_search",
+            methods=("search",),
+            progress_path=progress_path,
+            rank=rank,
+        )
+    else:
+        teacher_search = None
+
+    components["answer_model"] = answer_model
+    components["judge"] = judge
+    components["raw_inspector"] = raw_inspector
+    components["answer_validator"] = answer_validator
+    components["teacher_search"] = teacher_search
 
 
 def build_deepspeed_plugin(
@@ -231,7 +607,7 @@ class LocalStudentPlanner(ChatInteractivePlanner):
             observation=observation,
             schema=self.validator.schema_text(),
         )
-        raw = self.generator.generate(prompt)
+        raw = self.generator.generate(prompt, role=STUDENT_ADAPTER)
         self.last_raw_response = raw
         values = extract_json_array(raw)
         normalized = []
@@ -254,6 +630,89 @@ class LocalStudentPlanner(ChatInteractivePlanner):
         return [actions]
 
 
+class LocalTeacherPlanner(ChatInteractivePlanner):
+    """Privileged teacher planner backed by the live local policy model."""
+
+    def __init__(
+        self,
+        generator: "LocalPolicyGenerator",
+        validator: InteractiveActionValidator,
+    ):
+        self.generator = generator
+        self.validator = validator
+        self.calls = 0
+        self.last_raw_response = ""
+        self.last_candidate_sources: Dict[str, str] = {}
+        self.last_candidate_rationales: Dict[str, Dict[str, str]] = {}
+
+    def propose(
+        self,
+        query: str,
+        history: List[ToolAction],
+        observation: Any,
+        candidate_count: int = 3,
+        privileged_feedback: Optional[Dict[str, Any]] = None,
+    ) -> List[List[ToolAction]]:
+        self.calls += 1
+        prompt = build_compact_planner_prompt(
+            query=query,
+            history=history,
+            observation=observation,
+            allow_inspect_raw=self.validator.allow_inspect_raw,
+            candidate_count=candidate_count,
+            privileged_feedback=privileged_feedback,
+            max_actions_per_candidate=self.validator.max_chunk_actions,
+        )
+        raw = self.generator.generate(
+            prompt,
+            role=TEACHER_ADAPTER,
+            system_content=(
+                "Think in at most two short sentences if enabled, then write "
+                "</think> and output only the final JSON object."
+            ),
+        )
+        self.last_raw_response = raw
+        value = _extract_candidates_object(raw)
+        candidates = value.get("candidates")
+        if not isinstance(candidates, list):
+            raise ValueError("planner response has no candidates list")
+        validated: List[List[ToolAction]] = []
+        signatures = set()
+        self.last_candidate_sources = {}
+        self.last_candidate_rationales = {}
+        for candidate in candidates:
+            actions, rationale = self._parse_candidate(candidate)
+            if actions is None:
+                continue
+            signature = _actions_signature(actions)
+            if signature in signatures:
+                continue
+            validated.append(actions)
+            signatures.add(signature)
+            raw_values = (
+                candidate.get("actions") if isinstance(candidate, dict) else candidate
+            )
+            raw_signature = ""
+            if isinstance(raw_values, list):
+                raw_signature = json.dumps(
+                    [
+                        ToolAction.from_dict(value).to_dict()
+                        for value in raw_values
+                        if isinstance(value, dict)
+                    ],
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            self.last_candidate_sources[signature] = (
+                "planner" if raw_signature == signature else "planner_repaired"
+            )
+            if rationale:
+                self.last_candidate_rationales[signature] = rationale
+        if not validated:
+            raise ValueError("planner produced no valid action chunks")
+        return validated[: max(1, candidate_count)]
+
+
 class LocalPolicyGenerator:
     def __init__(
         self,
@@ -265,6 +724,8 @@ class LocalPolicyGenerator:
         temperature: float,
         top_p: float,
         enable_thinking: bool,
+        progress_path: Optional[Path] = None,
+        name: str = "policy",
     ):
         self.accelerator = accelerator
         self.model = model
@@ -273,16 +734,44 @@ class LocalPolicyGenerator:
         self.temperature = max(0.0, float(temperature))
         self.top_p = max(0.0, min(1.0, float(top_p)))
         self.enable_thinking = bool(enable_thinking)
+        self.progress_path = progress_path
+        self.name = name
+        self._generation_calls = 0
 
-    def generate(self, prompt: str) -> str:
+    def generate(
+        self,
+        prompt: str,
+        *,
+        role: str = STUDENT_ADAPTER,
+        system_content: Optional[str] = None,
+    ) -> str:
+        self._generation_calls += 1
+        call_id = self._generation_calls
+        started = time.time()
         model = self.accelerator.unwrap_model(self.model)
-        set_policy_role(model, STUDENT_ADAPTER)
+        set_policy_role(model, role)
         was_training = model.training
         model.eval()
         prompt_ids = render_policy_prompt(
             self.tokenizer,
             prompt,
             enable_thinking=self.enable_thinking,
+            system_content=system_content,
+        )
+        _append_progress_event(
+            self.progress_path,
+            {
+                "event": "generate_start",
+                "rank": self.accelerator.process_index,
+                "generator": self.name,
+                "call_id": call_id,
+                "role": role,
+                "prompt_chars": len(prompt),
+                "prompt_tokens": len(prompt_ids),
+                "max_new_tokens": self.max_new_tokens,
+                "enable_thinking": self.enable_thinking,
+                "temperature": self.temperature,
+            },
         )
         input_ids = torch.tensor(
             [prompt_ids],
@@ -304,21 +793,51 @@ class LocalPolicyGenerator:
                     "top_p": self.top_p,
                 }
             )
-        with torch.inference_mode():
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **generation_kwargs,
+        try:
+            with torch.inference_mode():
+                generated = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **generation_kwargs,
+                )
+            completion_ids = generated[0, input_ids.size(1) :]
+            raw = self.tokenizer.decode(
+                completion_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            _append_progress_event(
+                self.progress_path,
+                {
+                    "event": "generate_end",
+                    "rank": self.accelerator.process_index,
+                    "generator": self.name,
+                    "call_id": call_id,
+                    "role": role,
+                    "elapsed_s": round(time.time() - started, 3),
+                    "completion_tokens": int(completion_ids.numel()),
+                    "completion_chars": len(raw),
+                    "has_final_json": "[" in raw or "candidates" in raw,
+                },
             )
-        completion_ids = generated[0, input_ids.size(1) :]
-        raw = self.tokenizer.decode(
-            completion_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
-        if was_training:
-            model.train()
-        return raw
+            return raw
+        except Exception as exc:
+            _append_progress_event(
+                self.progress_path,
+                {
+                    "event": "generate_error",
+                    "rank": self.accelerator.process_index,
+                    "generator": self.name,
+                    "call_id": call_id,
+                    "role": role,
+                    "elapsed_s": round(time.time() - started, 3),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            raise
+        finally:
+            if was_training:
+                model.train()
 
 
 def render_policy_prompt(
@@ -327,6 +846,7 @@ def render_policy_prompt(
     *,
     privileged_context: Optional[str] = None,
     enable_thinking: bool = False,
+    system_content: Optional[str] = None,
 ) -> List[int]:
     if privileged_context:
         user_content = (
@@ -345,8 +865,11 @@ def render_policy_prompt(
         {
             "role": "system",
             "content": (
-                "Think privately if enabled. Supervise only the final answer: "
-                "a JSON array of executable tool actions."
+                system_content
+                or (
+                    "Think privately if enabled. Supervise only the final "
+                    "answer: a JSON array of executable tool actions."
+                )
             ),
         },
         {"role": "user", "content": user_content},
@@ -1265,6 +1788,11 @@ def _iter_local_samples(
     args: argparse.Namespace,
     accelerator: Accelerator,
 ) -> Iterable[OPDSample]:
+    hard_sample_manifest = getattr(args, "hard_sample_manifest", None)
+    if hard_sample_manifest:
+        yield from _iter_hard_manifest_samples(args, accelerator)
+        return
+
     data_dir = require_memgallery_dir(args.data_dir)
     paths = resolve_scenarios(args)
     local_paths = paths[
@@ -1316,6 +1844,83 @@ def _iter_local_samples(
             yield sample
 
 
+def _iter_hard_manifest_samples(
+    args: argparse.Namespace,
+    accelerator: Accelerator,
+) -> Iterable[OPDSample]:
+    manifest_path = Path(args.hard_sample_manifest).expanduser().resolve()
+    rows = [row for row in iter_jsonl(manifest_path)]
+    allowed = set(getattr(args, "hard_sample_datasets", None) or [])
+    if allowed:
+        rows = [row for row in rows if str(row.get("dataset") or "") in allowed]
+    if args.val_ratio > 0:
+        rows = [
+            row
+            for row in rows
+            if split_name(
+                str(row.get("uid") or row.get("sample_id") or ""),
+                args.val_ratio,
+                args.split_seed,
+            )
+            != "val"
+        ]
+    max_samples = getattr(args, "hard_sample_max_samples", None)
+    if max_samples is not None and max_samples > 0:
+        rows = rows[: int(max_samples)]
+    local_rows = rows[accelerator.process_index :: accelerator.num_processes]
+
+    dense_encoder = (
+        MiniLMTextEncoder(args.dense_model, device=args.dense_device)
+        if args.dense_mode == "minilm"
+        else None
+    )
+    vision_device = args.vision_device
+    if str(vision_device).startswith("cuda"):
+        vision_device = str(accelerator.device)
+    vision_encoder = (
+        SigLIPVisionEncoder(args.vision_model, device=vision_device)
+        if args.vision_mode == "siglip"
+        else None
+    )
+    worker_progress = _worker_progress_path(args, accelerator)
+    resolver = HardSampleResolver(
+        memgallery_dir=require_memgallery_dir(args.data_dir),
+        memeye_dir=args.memeye_dir,
+        locomo_path=args.locomo_path,
+        dense_encoder=dense_encoder,
+        vision_encoder=vision_encoder,
+    )
+    for row_index, row in enumerate(local_rows):
+        started = time.time()
+        _append_progress_event(
+            worker_progress,
+            {
+                "event": "resolve_start",
+                "rank": accelerator.process_index,
+                "row_index": row_index,
+                "sample_id": row.get("sample_id"),
+                "uid": row.get("uid"),
+                "dataset": row.get("dataset"),
+                "domain": row.get("domain"),
+            },
+        )
+        sample = resolver.resolve(row)
+        _append_progress_event(
+            worker_progress,
+            {
+                "event": "resolve_end",
+                "rank": accelerator.process_index,
+                "row_index": row_index,
+                "sample_id": sample.sample_id,
+                "elapsed_s": round(time.time() - started, 3),
+                "memory_count": len(sample.memory_store),
+            },
+        )
+        sample.metadata.pop("teacher_privileged_context", None)
+        sample.metadata["hard_sample_manifest"] = str(manifest_path)
+        yield sample
+
+
 def _batch_local_samples(
     iterator: Iterable[OPDSample],
     batch_size: int,
@@ -1328,6 +1933,31 @@ def _batch_local_samples(
             batch = []
     if batch:
         yield batch
+
+
+def _planned_sample_count(args: argparse.Namespace) -> Optional[int]:
+    hard_sample_manifest = getattr(args, "hard_sample_manifest", None)
+    if hard_sample_manifest:
+        rows = [row for row in iter_jsonl(Path(hard_sample_manifest))]
+        allowed = set(getattr(args, "hard_sample_datasets", None) or [])
+        if allowed:
+            rows = [row for row in rows if str(row.get("dataset") or "") in allowed]
+        if args.val_ratio > 0:
+            rows = [
+                row
+                for row in rows
+                if split_name(
+                    str(row.get("uid") or row.get("sample_id") or ""),
+                    args.val_ratio,
+                    args.split_seed,
+                )
+                != "val"
+            ]
+        max_samples = getattr(args, "hard_sample_max_samples", None)
+        if max_samples is not None and max_samples > 0:
+            rows = rows[: int(max_samples)]
+        return len(rows)
+    return None
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -1443,6 +2073,7 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
     if proxy:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             os.environ[key] = proxy
+    _require_env_api_keys(args)
     mixed_precision = "bf16" if args.bf16 else "fp16"
     deepspeed_plugin = build_deepspeed_plugin(args)
     accelerator_kwargs: Dict[str, Any] = {
@@ -1458,9 +2089,17 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
                 gradient_as_bucket_view=True,
             )
         ]
-    accelerator = Accelerator(
-        **accelerator_kwargs,
+    distributed_timeout = max(
+        1,
+        int(getattr(args, "distributed_timeout_minutes", 60)),
     )
+    process_group_kwargs = InitProcessGroupKwargs(
+        timeout=timedelta(minutes=distributed_timeout)
+    )
+    accelerator_kwargs.setdefault("kwargs_handlers", []).append(
+        process_group_kwargs
+    )
+    accelerator = Accelerator(**accelerator_kwargs)
     set_seed(args.seed + accelerator.process_index)
 
     run_name = args.wandb_run_name or f"opd-stream-{now_stamp()}"
@@ -1500,6 +2139,18 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
             },
         )
 
+    worker_progress = _worker_progress_path(args, accelerator)
+    _append_progress_event(
+        worker_progress,
+        {
+            "event": "worker_start",
+            "rank": accelerator.process_index,
+            "num_processes": accelerator.num_processes,
+            "device": str(accelerator.device),
+            "run_dir": str(run_dir),
+        },
+    )
+
     model, tokenizer = load_policy_model(args, accelerator)
     optimizer_parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
@@ -1537,8 +2188,55 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         temperature=args.student_rollout_temperature,
         top_p=args.student_rollout_top_p,
         enable_thinking=args.student_enable_thinking,
+        progress_path=worker_progress,
+        name="student",
+    )
+    teacher_generator = LocalPolicyGenerator(
+        accelerator,
+        model,
+        tokenizer,
+        max_new_tokens=args.planner_max_tokens,
+        temperature=0.0,
+        top_p=1.0,
+        enable_thinking=args.teacher_planner_enable_thinking,
+        progress_path=worker_progress,
+        name="teacher",
     )
     local_planner = LocalStudentPlanner(generator, components["validator"])
+    if getattr(args, "stream_teacher_source", "local") == "local":
+        local_teacher_planner = LocalTeacherPlanner(
+            teacher_generator,
+            components["validator"],
+        )
+        components["teacher_search"] = InteractiveTeacherSearch(
+            planner=local_teacher_planner,
+            verifier=None,
+            validator=components["validator"],
+            retriever=components["retriever"],
+            max_rounds=args.teacher_max_rounds,
+            beam_size=args.teacher_beam_size,
+            candidates_per_node=args.teacher_candidates,
+            max_actions=args.teacher_max_actions,
+            max_evidence=args.max_evidence,
+            raw_inspector=components["raw_inspector"],
+            max_raw_inspections=args.max_raw_inspections,
+            answer_validator=components["answer_validator"],
+            trajectory_action_cost=args.trajectory_action_cost,
+            trajectory_evidence_cost=args.trajectory_evidence_cost,
+        )
+    _install_external_call_heartbeats(
+        components,
+        progress_path=worker_progress,
+        rank=accelerator.process_index,
+    )
+    _append_progress_event(
+        worker_progress,
+        {
+            "event": "teacher_source",
+            "rank": accelerator.process_index,
+            "stream_teacher_source": getattr(args, "stream_teacher_source", "local"),
+        },
+    )
     distiller = OnlineSelfDistiller(
         student_planner=local_planner,
         teacher_search=components["teacher_search"],
@@ -1579,6 +2277,16 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
     rollouts_path = run_dir / "online_rollouts.jsonl"
     examples_path = run_dir / "online_examples.jsonl"
     metrics_path = run_dir / "metrics.json"
+    planned_samples = _planned_sample_count(args)
+    progress = ProgressBar(
+        planned_samples or 0,
+        "OPD streaming",
+        enabled=(
+            accelerator.is_main_process
+            and not getattr(args, "no_progress", False)
+            and bool(planned_samples)
+        ),
+    )
 
     while True:
         local_batch = next(local_iterator, None)
@@ -1595,10 +2303,69 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         local_examples = []
         local_multi_action_targets = 0
         if local_batch is not None:
-            for sample in local_batch:
-                result = distiller.collect_sample(
-                    sample,
-                    round_index=optimizer_step,
+            for local_sample_index, sample in enumerate(local_batch):
+                sample_started = time.time()
+                _append_progress_event(
+                    worker_progress,
+                    {
+                        "event": "sample_start",
+                        "rank": accelerator.process_index,
+                        "optimizer_step": optimizer_step,
+                        "rollout_batch_index": rollout_batch_index,
+                        "local_sample_index": local_sample_index,
+                        "sample_id": sample.sample_id,
+                        "query": sample.query[:200],
+                        "dataset": sample.metadata.get("dataset"),
+                        "scenario": sample.metadata.get("scenario"),
+                        "memory_count": len(sample.memory_store),
+                    },
+                )
+                try:
+                    with sample_timeout(
+                        int(getattr(args, "sample_timeout_seconds", 0))
+                    ):
+                        result = distiller.collect_sample(
+                            sample,
+                            round_index=optimizer_step,
+                        )
+                except SampleTimeoutError as exc:
+                    _append_progress_event(
+                        worker_progress,
+                        {
+                            "event": "sample_timeout",
+                            "rank": accelerator.process_index,
+                            "optimizer_step": optimizer_step,
+                            "rollout_batch_index": rollout_batch_index,
+                            "local_sample_index": local_sample_index,
+                            "sample_id": sample.sample_id,
+                            "elapsed_s": round(
+                                time.time() - sample_started,
+                                3,
+                            ),
+                            "error": str(exc),
+                        },
+                    )
+                    result = _timeout_sample_result(
+                        sample,
+                        error=str(exc),
+                    )
+                _append_progress_event(
+                    worker_progress,
+                    {
+                        "event": "sample_end",
+                        "rank": accelerator.process_index,
+                        "optimizer_step": optimizer_step,
+                        "rollout_batch_index": rollout_batch_index,
+                        "local_sample_index": local_sample_index,
+                        "sample_id": sample.sample_id,
+                        "elapsed_s": round(time.time() - sample_started, 3),
+                        "student_actions": [
+                            action.to_dict()
+                            for action in result.student_actions
+                        ],
+                        "correction_count": len(result.corrections),
+                        "teacher_attempt_count": len(result.teacher_attempts),
+                    },
                 )
                 rollout_row = result.to_dict()
                 rollout_row["policy_version"] = optimizer_step
@@ -1654,6 +2421,14 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         if accelerator.is_main_process:
             _write_jsonl(rollouts_path, gathered_rollouts)
             _write_jsonl(examples_path, gathered_examples)
+            progress.update(
+                samples_seen,
+                (
+                    f"examples={examples_seen} "
+                    f"step={optimizer_step} "
+                    f"pending={len(pending)}"
+                ),
+            )
 
         while True:
             rank_batch = _prepare_rank_batch(
@@ -1776,6 +2551,14 @@ def run_streaming_opd(args: argparse.Namespace) -> Path:
         )
     elapsed = time.time() - started
     if accelerator.is_main_process:
+        progress.update(
+            samples_seen,
+            (
+                f"examples={examples_seen} "
+                f"step={optimizer_step} done"
+            ),
+        )
+        progress.close()
         metrics = {
             "mode": "streaming_on_policy_distillation",
             "samples_seen": samples_seen,
