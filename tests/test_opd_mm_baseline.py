@@ -959,7 +959,7 @@ def test_memgallery_adapter_splits_text_and_image_memories(tmp_path):
         "verified_action_advice"
     ]
     assert advice["recommended"]["minimum_top_k"] >= 1
-    assert advice["trajectory_shape"] == ["RETRIEVE", "READ", "STOP"]
+    assert advice["trajectory_shape"] == ["RETRIEVE", "STOP"]
 
 
 def test_memeye_paths_are_normalized_to_memgallery_image_format(tmp_path):

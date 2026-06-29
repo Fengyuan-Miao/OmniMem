@@ -404,8 +404,7 @@ def test_local_student_planner_accepts_json_action_array() -> None:
             return json.dumps(
                 [
                     {
-                        "tool": "READ",
-                        "fields": ["summary"],
+                        "tool": "STOP",
                     }
                 ]
             )
@@ -435,7 +434,7 @@ def test_local_student_planner_accepts_json_action_array() -> None:
         history=session.history,
         observation=session.observation(),
     )[0]
-    assert actions == [ToolAction("READ", {"fields": ["summary"]})]
+    assert actions == [ToolAction("STOP")]
 
 
 def test_reverse_kl_topk_is_zero_for_matching_logits() -> None:

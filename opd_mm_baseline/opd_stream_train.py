@@ -607,7 +607,12 @@ class LocalStudentPlanner(ChatInteractivePlanner):
             observation=observation,
             schema=self.validator.schema_text(),
         )
-        raw = self.generator.generate(prompt, role=STUDENT_ADAPTER)
+        try:
+            raw = self.generator.generate(prompt, role=STUDENT_ADAPTER)
+        except TypeError as exc:
+            if "role" not in str(exc):
+                raise
+            raw = self.generator.generate(prompt)
         self.last_raw_response = raw
         values = extract_json_array(raw)
         normalized = []

@@ -553,7 +553,8 @@ more selective trajectory while preserving coverage.
   top_k that can actually reach the support. Do not copy support metadata into
   FILTER values.
 - When verified_action_advice is present, follow its minimum_top_k requirement,
-  READ the retrieved pool, and do not apply a smaller TOPK afterward.
+  keep the retrieved pool available as evidence, and do not apply a smaller
+  TOPK afterward.
 """
         prompt = f"""You are a hindsight teacher for multimodal memory retrieval.
 
@@ -572,7 +573,8 @@ General correction principles:
 - For relevance questions, preserve RETRIEVE ranking; do not SORT by time after
   RETRIEVE unless temporal order is explicitly required.
 - For recency/first/last questions, FILTER and SORT the hidden pool before TOPK.
-- Always READ useful fields before STOP.
+- In the interactive schema, retrieved memories are already answer evidence;
+  do not add a READ action unless the schema explicitly lists READ.
 - Use INSPECT_RAW only when it is present in the allowed schema.
 {oracle_rules}
 {revision}
@@ -918,7 +920,7 @@ Return only JSON:
   "failure_type": "",
   "evidence_gap": "",
   "recommended_change": "",
-  "recommended_tool": "RETRIEVE|READ|INSPECT_RAW|EXPAND_NEIGHBORS|FILTER|SORT|TOPK|STOP",
+  "recommended_tool": "RETRIEVE|INSPECT_RAW|EXPAND_NEIGHBORS|FILTER|SORT|TOPK|STOP",
   "recommended_retrieval_method": "bm25|dense|vision|hybrid",
   "recommended_query_focus": "short non-gold search focus, if retrieval should change",
   "needs_text_evidence": false,

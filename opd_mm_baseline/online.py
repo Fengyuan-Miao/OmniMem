@@ -14,6 +14,7 @@ from .interactive import (
     InteractiveActionValidator,
     InteractiveTeacherSearch,
     StrictAnswerValidator,
+    verification_from_answer_validation,
     fallback_action_chunks,
 )
 from .models import OPDSample, SFTExample, ToolAction
@@ -100,6 +101,7 @@ class OnlineCorrection:
     student_raw_response: str = ""
     teacher_action_source: str = ""
     teacher_verification: Optional[Dict[str, Any]] = None
+    trigger_verification: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +121,7 @@ class OnlineCorrection:
             ),
             "teacher_action_source": self.teacher_action_source,
             "teacher_verification": self.teacher_verification or {},
+            "trigger_verification": self.trigger_verification or {},
             "example": self.example.to_dict(),
         }
 
@@ -299,15 +302,26 @@ class OnlineSelfDistiller:
         round_index: int,
         student_actions: List[ToolAction],
         student_raw_response: str,
+        student_evidence_after: AnswerValidationResult,
         corrections: List[OnlineCorrection],
         teacher_attempts: List[Dict[str, Any]],
     ) -> None:
+        trigger_verification = verification_from_answer_validation(
+            student_evidence_after,
+            session.evidence,
+            can_inspect_raw=(
+                self.validator.allow_inspect_raw
+                and self.raw_inspector is not None
+            ),
+        )
+        trigger_feedback = trigger_verification.planner_feedback()
         teacher_result = self.teacher_search.search(
             query=sample.query,
             gold_answer=sample.gold_answer,
             memory_store=sample.memory_store,
             question_image=question_image,
             initial_session=session,
+            initial_verification=trigger_verification,
         )
         decision_sources = [
             decision.action_source for decision in teacher_result.decisions
@@ -347,6 +361,8 @@ class OnlineSelfDistiller:
                 ),
                 "selected_path_trainable": trainable_path,
                 "verification": teacher_result.verification.to_dict(),
+                "trigger_verification": trigger_verification.to_dict(),
+                "trigger_feedback": trigger_feedback,
                 "answer_validation": (
                     teacher_result.answer_validation.to_dict(
                         include_reason=False
@@ -391,6 +407,7 @@ class OnlineSelfDistiller:
                     "online_state_index": state_index,
                     "teacher_decision_index": decision_index,
                     "teacher_trigger": self.teacher_trigger,
+                    "trigger_feedback": trigger_feedback,
                 }
             )
             correction = OnlineCorrection(
@@ -403,6 +420,7 @@ class OnlineSelfDistiller:
                 example=example,
                 teacher_action_source=decision.action_source,
                 teacher_verification=decision.verification_after.to_dict(),
+                trigger_verification=trigger_verification.to_dict(),
             )
             corrections.append(correction)
             self.buffer.add(example, round_index)
@@ -450,6 +468,17 @@ class OnlineSelfDistiller:
                 student_actions = (
                     fallback[0] if fallback else [ToolAction("STOP")]
                 )
+            try:
+                student_actions = self.validator.repair(student_actions)
+            except Exception:
+                fallback = fallback_action_chunks(
+                    observation,
+                    self.validator,
+                    candidate_count=1,
+                )
+                student_actions = (
+                    fallback[0] if fallback else [ToolAction("STOP")]
+                )
             student_raw_response = str(
                 getattr(self.student_planner, "last_raw_response", "") or ""
             ).strip()
@@ -477,6 +506,7 @@ class OnlineSelfDistiller:
                         round_index=round_index,
                         student_actions=student_actions,
                         student_raw_response=student_raw_response,
+                        student_evidence_after=student_evidence_after,
                         corrections=corrections,
                         teacher_attempts=teacher_attempts,
                     )
@@ -509,6 +539,7 @@ class OnlineSelfDistiller:
                     round_index=round_index,
                     student_actions=student_actions,
                     student_raw_response=student_raw_response,
+                    student_evidence_after=student_evidence_after,
                     corrections=corrections,
                     teacher_attempts=teacher_attempts,
                 )

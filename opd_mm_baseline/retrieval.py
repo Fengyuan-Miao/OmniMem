@@ -191,7 +191,7 @@ class HiddenMemoryStore:
                     "method": method,
                     "minimum_top_k": top_k,
                     "verified_objective": objective,
-                    "must_read_after_retrieval": True,
+                    "retrieval_outputs_evidence": True,
                     "do_not_apply_smaller_topk_after_retrieval": True,
                 }
             )
@@ -206,7 +206,7 @@ class HiddenMemoryStore:
         return {
             "recommended": options[0] if options else None,
             "alternatives": options[1:],
-            "trajectory_shape": ["RETRIEVE", "READ", "STOP"],
+            "trajectory_shape": ["RETRIEVE", "STOP"],
             "note": (
                 "These are training-only counterfactual action requirements. "
                 "They expose neither support identifiers nor support content."

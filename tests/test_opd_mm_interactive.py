@@ -103,7 +103,7 @@ def test_interactive_validator_allows_rewrite_and_blocks_dead_actions() -> None:
                 "top_k": 5,
                 "query": "banana project",
             },
-            {"tool": "READ", "fields": ["summary", "content"]},
+            {"tool": "TOPK", "k": 1},
         ]
     )
     assert actions[0].arguments["query"] == "banana project"
@@ -111,7 +111,11 @@ def test_interactive_validator_allows_rewrite_and_blocks_dead_actions() -> None:
     with pytest.raises(InteractiveValidationError):
         validator.validate(
             [
-                {"tool": "READ", "fields": ["summary"]},
+                {
+                    "tool": "INSPECT_RAW",
+                    "target": "current_pool",
+                    "instruction": "answer_query_related_visual_details",
+                },
                 {"tool": "TOPK", "k": 2},
             ]
         )
@@ -132,16 +136,17 @@ def test_interactive_validator_repairs_harmless_schema_drift() -> None:
     actions = validator.repair(
         [
             {
-                "tool": "READ",
-                "fields": ["content", "summary"],
-                "limit": 2,
+                "tool": "RETRIEVE",
+                "method": "bm25",
+                "top_k": 2,
+                "query": "banana",
                 "pool_record_id": 1,
             },
             {"tool": "STOP", "reason": "done"},
         ]
     )
     assert actions == [
-        ToolAction("READ", {"fields": ["content", "summary"]}),
+        ToolAction("RETRIEVE", {"method": "bm25", "top_k": 2, "query": "banana"}),
         ToolAction("STOP"),
     ]
 
@@ -152,14 +157,14 @@ def test_atomic_validator_repairs_to_first_executable_action() -> None:
         validator.validate(
             [
                 {"tool": "RETRIEVE", "method": "bm25", "top_k": 2},
-                {"tool": "READ", "fields": ["summary"]},
+                {"tool": "STOP"},
             ]
         )
 
     actions = validator.repair(
         [
             {"tool": "RETRIEVE", "method": "bm25", "top_k": 2},
-            {"tool": "READ", "fields": ["summary"]},
+            {"tool": "STOP"},
         ]
     )
     assert actions == [
@@ -183,11 +188,11 @@ def test_atomic_fallback_returns_single_actions_by_state() -> None:
 
     session.execute_chunk(first)
     second = fallback_action_chunks(session.observation(), validator)[0]
-    assert [action.tool for action in second] == ["READ"]
+    assert [action.tool for action in second] == ["EXPAND_NEIGHBORS"]
 
     session.execute_chunk(second)
     third = fallback_action_chunks(session.observation(), validator)[0]
-    assert [action.tool for action in third] == ["INSPECT_RAW"]
+    assert [action.tool for action in third] == ["EXPAND_NEIGHBORS"]
 
 
 def test_executor_observation_is_hidden_until_pool_selection() -> None:
@@ -210,7 +215,6 @@ def test_executor_observation_is_hidden_until_pool_selection() -> None:
                 "top_k": 1,
                 "query": "Bob banana project",
             },
-            {"tool": "READ", "fields": ["summary", "content", "turn_id"]},
         ]
     )
     assert after.pool_turn_count == 1
@@ -239,7 +243,6 @@ def test_executor_observation_is_hidden_until_pool_selection() -> None:
                 "top_k": 1,
                 "query": "Bob banana project",
             },
-            {"tool": "READ", "fields": ["summary", "content", "turn_id"]},
         ]
     )
     assert repeated.new_evidence_count == 0
@@ -292,8 +295,6 @@ def test_atomic_policy_runner_reobserves_after_each_action() -> None:
                         )
                     ]
                 ]
-            if observation.evidence_count == 0:
-                return [[ToolAction("READ", {"fields": ["summary"]})]]
             return [[ToolAction("STOP")]]
 
     planner = AtomicPlanner()
@@ -308,14 +309,12 @@ def test_atomic_policy_runner_reobserves_after_each_action() -> None:
     result = runner.run("Which project did Bob select?", make_store())
     assert [action.tool for action in result.actions] == [
         "RETRIEVE",
-        "READ",
         "STOP",
     ]
-    assert len(planner.observations) == 3
+    assert len(planner.observations) == 2
     assert planner.observations[0].candidate_previews == []
     assert planner.observations[1].candidate_previews
-    assert planner.observations[1].evidence_count == 0
-    assert planner.observations[2].evidence_count > 0
+    assert planner.observations[1].evidence_count > 0
 
 
 def test_online_policy_prompt_uses_compact_observation() -> None:
@@ -333,17 +332,6 @@ def test_online_policy_prompt_uses_compact_observation() -> None:
                 "method": "bm25",
                 "top_k": 2,
                 "query": "Bob banana project",
-            },
-            {
-                "tool": "READ",
-                "fields": [
-                    "summary",
-                    "content",
-                    "timestamp",
-                    "session_date",
-                    "turn_id",
-                    "raw_pointer",
-                ],
             },
         ]
     )
@@ -428,7 +416,6 @@ class FakePlanner:
                     "RETRIEVE",
                     {"method": "bm25", "top_k": 1, "query": "apples"},
                 ),
-                ToolAction("READ", {"fields": ["summary", "content"]}),
             ],
             [
                 ToolAction(
@@ -439,7 +426,6 @@ class FakePlanner:
                         "query": "Bob banana project",
                     },
                 ),
-                ToolAction("READ", {"fields": ["summary", "content"]}),
             ],
         ][:candidate_count]
 
@@ -466,9 +452,7 @@ class LongerFirstPlanner:
                     "RETRIEVE",
                     {"method": "hybrid", "top_k": 3, "query": "banana"},
                 ),
-                ToolAction("READ", {"fields": ["summary", "content"]}),
                 ToolAction("EXPAND_NEIGHBORS", {"window": 1}),
-                ToolAction("READ", {"fields": ["summary", "content"]}),
             ],
             [
                 ToolAction(
@@ -479,7 +463,6 @@ class LongerFirstPlanner:
                         "query": "Bob banana project",
                     },
                 ),
-                ToolAction("READ", {"fields": ["summary", "content"]}),
             ],
         ][:candidate_count]
 
@@ -583,7 +566,7 @@ def test_teacher_search_prefers_short_successful_path_with_cost() -> None:
     assert result.answer_validation is not None
     assert result.answer_validation.correct
     tools = [action.tool for action in result.actions]
-    assert tools == ["RETRIEVE", "READ", "STOP"]
+    assert tools == ["RETRIEVE", "STOP"]
     assert any(
         action.arguments.get("query") == "Bob banana project"
         for action in result.actions
@@ -665,12 +648,11 @@ def test_chat_planner_prompt_has_no_gold_interface() -> None:
     assert "SECRET_GOLD" not in client.prompt
     assert "gold answer" not in client.prompt.lower()
     assert "memory_id" not in client.prompt
-    assert "it does NOT add answer evidence" in client.prompt
+    assert "replace/extend the current evidence pool" in client.prompt
     assert "bm25|dense|vision|hybrid" in client.prompt
     assert "Analyze the query before choosing RETRIEVE.method" in client.prompt
     assert "Use vision for SigLIP visual search" in client.prompt
-    assert "RETRIEVE alone cannot support an answer" in client.prompt
-    assert "read or inspect them instead of" in client.prompt
+    assert "RETRIEVE directly replaces the current evidence pool" in client.prompt
     assert "Answer-model feedback:" in client.prompt
     assert "recommended_tool" in client.prompt
 
@@ -720,7 +702,7 @@ def test_chat_planner_student_simple_uses_action_array_prompt() -> None:
     assert "final JSON action array" in client.prompt
     assert '"reflection"' not in client.prompt
     assert "Return a memory-tool policy JSON" not in client.prompt
-    assert "candidates" not in client.prompt
+    assert '"candidates":[' not in client.prompt
 
 
 def test_chat_planner_does_not_inject_fallback_for_visible_pool() -> None:
@@ -909,6 +891,21 @@ class GoldAwareAssessAnswer:
             "avoid_action": "STOP",
             "reason": "missing support",
         }
+
+
+def test_planner_feedback_always_contains_failure_diagnostic() -> None:
+    feedback = VerificationResult(
+        False,
+        0.1,
+        0.2,
+        0.0,
+        reason="The current evidence is too generic.",
+    ).planner_feedback()
+    assert feedback["continue_required"] is True
+    assert feedback["failure_diagnostic"]["failure_type"] == (
+        "insufficient_evidence"
+    )
+    assert feedback["failure_diagnostic"]["recommended_tool"] == "RETRIEVE"
 
 
 def test_extract_json_object_repairs_truncated_tail() -> None:
@@ -1137,7 +1134,6 @@ class CorrectingPlanner:
                 "RETRIEVE",
                 {"method": "bm25", "top_k": 1, "query": term},
             ),
-            ToolAction("READ", {"fields": ["content"]}),
         ]
         signature = json.dumps(
             [action.to_dict() for action in actions],
@@ -1263,7 +1259,7 @@ def test_teacher_search_uses_online_fallback_instead_of_empty_stop() -> None:
         memory_store=make_store(),
     )
     assert result.verification.answerable
-    assert any(action.tool == "READ" for action in result.actions)
+    assert any(action.tool == "RETRIEVE" for action in result.actions)
     assert result.decisions[0].action_source == "controller_fallback"
 
 
@@ -1361,7 +1357,6 @@ def test_planner_repaired_and_system_stop_are_trainable_path() -> None:
         history=[],
         actions=[
             ToolAction("RETRIEVE", {"method": "hybrid", "top_k": 5}),
-            ToolAction("READ", {"fields": ["summary"]}),
         ],
         privileged_feedback={},
         verification_after=VerificationResult(True, 1.0, 1.0, 0.0),
@@ -1380,7 +1375,7 @@ def test_planner_repaired_and_system_stop_are_trainable_path() -> None:
         observation=observation,
         observation_after=observation,
         history=[],
-        actions=[ToolAction("READ", {"fields": ["summary"]})],
+        actions=[ToolAction("RETRIEVE", {"method": "bm25", "top_k": 5})],
         privileged_feedback={},
         verification_after=VerificationResult(True, 1.0, 1.0, 0.0),
         action_source="controller_fallback",
@@ -1420,7 +1415,6 @@ class OnlineStudentPlanner:
                     "RETRIEVE",
                     {"method": "bm25", "top_k": 1, "query": "apples"},
                 ),
-                ToolAction("READ", {"fields": ["content"]}),
             ]
         ]
 
@@ -1547,6 +1541,28 @@ def test_online_self_distiller_triggers_teacher_after_student_failure() -> None:
     assert result.teacher_attempts[0]["state_index"] == 0
     assert result.teacher_attempts[1]["state_index"] == 1
     assert result.teacher_attempts[0]["trigger"] == "failure"
+    assert (
+        result.teacher_attempts[0]["trigger_feedback"][
+            "failure_diagnostic"
+        ]["avoid_action"]
+        == "STOP"
+    )
+    assert (
+        result.teacher_attempts[1]["trigger_feedback"][
+            "failure_diagnostic"
+        ]["recommended_tool"]
+        == "RETRIEVE"
+    )
+    first_correction = result.corrections[0]
+    teacher_input = first_correction.example.metadata["opd"]["teacher_input"]
+    assert '"failure_diagnostic"' in teacher_input
+    assert first_correction.trigger_verification
+    assert (
+        first_correction.example.metadata["trigger_feedback"][
+            "failure_diagnostic"
+        ]["avoid_action"]
+        == "STOP"
+    )
     assert any(
         "Alice discussed apples" in correction.example.input
         for correction in result.corrections
@@ -1558,7 +1574,7 @@ def test_streaming_examples_keep_chunk_teacher_targets() -> None:
     example = SFTExample(
         "sample:online:0:0",
         "student prompt",
-        '[{"tool":"RETRIEVE"},{"tool":"READ"}]',
+        '[{"tool":"RETRIEVE"}]',
         metadata={
             "teacher_decision_index": 0,
             "opd": {"teacher_input": "teacher prompt"},
@@ -1570,7 +1586,6 @@ def test_streaming_examples_keep_chunk_teacher_targets() -> None:
         student_actions=[ToolAction("STOP")],
         teacher_actions=[
             ToolAction("RETRIEVE", {"method": "bm25", "top_k": 3}),
-            ToolAction("READ", {"fields": ["content"]}),
         ],
         teacher_answer_validation=AnswerValidationResult(True, 1.0, ""),
         example=example,
@@ -1593,7 +1608,6 @@ def test_streaming_examples_keep_chunk_teacher_targets() -> None:
     assert len(rows) == 1
     assert rows[0].teacher_actions == [
         {"tool": "RETRIEVE", "method": "bm25", "top_k": 3},
-        {"tool": "READ", "fields": ["content"]},
     ]
 
 
@@ -1615,7 +1629,6 @@ class SuccessfulStudentPlanner(OnlineStudentPlanner):
                     "RETRIEVE",
                     {"method": "bm25", "top_k": 1, "query": "banana"},
                 ),
-                ToolAction("READ", {"fields": ["content"]}),
             ]
         ]
 
@@ -1696,7 +1709,6 @@ def test_online_self_distiller_stops_rollout_when_evidence_sufficient() -> None:
     assert result.student_evidence_sufficiency.correct
     assert [action.tool for action in result.student_actions] == [
         "RETRIEVE",
-        "READ",
         "STOP",
     ]
     assert planner.calls == 1
@@ -1715,6 +1727,7 @@ def test_online_self_distiller_keeps_repaired_inspect_raw_path() -> None:
             memory_store,
             question_image=None,
             initial_session=None,
+            initial_verification=None,
         ):
             self.calls += 1
             session = initial_session or ExecutorSession(

@@ -29,7 +29,6 @@ from .schema import (
     INSPECT_INSTRUCTIONS,
     INSPECT_TARGETS,
     MEMORY_ID_PATTERN,
-    READ_FIELDS,
     RETRIEVAL_METHODS,
     SORT_FIELDS,
     SORT_ORDERS,
@@ -43,10 +42,10 @@ POOL_MUTATING_TOOLS = {
     "RETRIEVE",
     "EXPAND_NEIGHBORS",
 }
-INTERACTIVE_TOOLS = POOL_MUTATING_TOOLS | {"READ", "INSPECT_RAW", "STOP"}
+INTERACTIVE_TOOLS = POOL_MUTATING_TOOLS | {"INSPECT_RAW", "STOP"}
 RETRIEVE_SCOPES = {"all", "current"}
 PUBLIC_IMAGE_ID_PATTERN = re.compile(r"\bD\d+:IMG_\d+\b")
-DEFAULT_READ_FIELDS = [
+DEFAULT_EVIDENCE_FIELDS = [
     "summary",
     "content",
     "timestamp",
@@ -115,7 +114,6 @@ def build_interactive_schema(
         "SORT(field=timestamp|turn_id|score, order=asc|desc)",
         "TOPK(k=positive integer)",
         "EXPAND_NEIGHBORS(window=1|2|3)",
-        "READ(fields=[summary|content|timestamp|session_date|turn_id|author|modality|source_type|raw_pointer])",
     ]
     if allow_inspect_raw:
         lines.extend(
@@ -136,10 +134,10 @@ def build_interactive_schema(
             "RETRIEVE may rewrite the",
             "query using only the user request and observed evidence. Never emit",
             "memory IDs or file paths.",
+            "RETRIEVE/FILTER/SORT/TOPK/EXPAND_NEIGHBORS directly refresh the",
+            "answer evidence with the current pool.",
         ]
     )
-    if not atomic:
-        lines.append("Pool-changing actions must occur before READ.")
     return "\n".join(lines)
 
 
@@ -181,17 +179,17 @@ class InteractiveActionValidator:
                 f"chunk has {len(actions)} actions; maximum is "
                 f"{self.max_chunk_actions}"
             )
-        seen_read = False
+        seen_inspection = False
         for index, action in enumerate(actions):
             self._validate_action(action, index)
             if action.tool == "STOP" and index != len(actions) - 1:
                 raise InteractiveValidationError("STOP must be final in a chunk")
-            if seen_read and action.tool in POOL_MUTATING_TOOLS:
+            if seen_inspection and action.tool in POOL_MUTATING_TOOLS:
                 raise InteractiveValidationError(
-                    f"action {index}: {action.tool} after READ is a dead action"
+                    f"action {index}: {action.tool} after INSPECT_RAW is a dead action"
                 )
-            if action.tool in {"READ", "INSPECT_RAW"}:
-                seen_read = True
+            if action.tool == "INSPECT_RAW":
+                seen_inspection = True
         return actions
 
     def repair(
@@ -202,6 +200,8 @@ class InteractiveActionValidator:
         if self.max_chunk_actions == 1:
             for value in values:
                 repaired = self._repair_action(value)
+                if repaired is None:
+                    continue
                 try:
                     return self.validate([repaired])
                 except InteractiveValidationError:
@@ -209,14 +209,19 @@ class InteractiveActionValidator:
             return self.validate([])
 
         repaired: List[ToolAction] = []
-        for value in list(values)[: self.max_chunk_actions]:
-            repaired.append(self._repair_action(value))
+        for value in values:
+            action = self._repair_action(value)
+            if action is None:
+                continue
+            repaired.append(action)
+            if len(repaired) >= self.max_chunk_actions:
+                break
         return self.validate(repaired)
 
     def _repair_action(
         self,
         value: Dict[str, Any] | ToolAction,
-    ) -> ToolAction:
+    ) -> Optional[ToolAction]:
         action = (
             value
             if isinstance(value, ToolAction)
@@ -244,18 +249,7 @@ class InteractiveActionValidator:
                 repaired_args["scope"] = args["scope"]
             return ToolAction("RETRIEVE", repaired_args)
         if action.tool == "READ":
-            fields = args.get("fields")
-            if not isinstance(fields, list):
-                fields = DEFAULT_READ_FIELDS
-            valid_fields = [
-                field
-                for field in fields
-                if isinstance(field, str) and field in READ_FIELDS
-            ]
-            return ToolAction(
-                "READ",
-                {"fields": valid_fields or list(DEFAULT_READ_FIELDS)},
-            )
+            return None
         if action.tool == "FILTER":
             return ToolAction(
                 "FILTER",
@@ -393,19 +387,6 @@ class InteractiveActionValidator:
                 f"action {index}: window must be 1, 2, or 3"
             )
 
-    def _validate_read(self, args: Dict[str, Any], index: int) -> None:
-        self._keys(args, {"fields"}, set(), index)
-        fields = args["fields"]
-        if not isinstance(fields, list) or not fields:
-            raise InteractiveValidationError(
-                f"action {index}: READ fields must be a non-empty list"
-            )
-        unknown = set(fields) - READ_FIELDS
-        if unknown:
-            raise InteractiveValidationError(
-                f"action {index}: invalid READ fields {sorted(unknown)}"
-            )
-
     def _validate_inspect_raw(self, args: Dict[str, Any], index: int) -> None:
         self._keys(args, set(), {"target", "instruction"}, index)
         if args.get("target", "current_pool") not in INSPECT_TARGETS:
@@ -492,6 +473,7 @@ class InteractiveObservation:
     stopped: bool
     last_error: str = ""
     has_question_image: bool = False
+    has_visual_candidates: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -507,6 +489,7 @@ class InteractiveObservation:
             "stopped": self.stopped,
             "last_error": self.last_error,
             "has_question_image": self.has_question_image,
+            "has_visual_candidates": self.has_visual_candidates,
         }
 
     def to_prompt_dict(self) -> Dict[str, Any]:
@@ -543,6 +526,7 @@ class InteractiveObservation:
             "stopped": self.stopped,
             "last_error": _clip(self.last_error, 180),
             "has_question_image": self.has_question_image,
+            "has_visual_candidates": self.has_visual_candidates,
         }
 
 
@@ -616,29 +600,34 @@ class ExecutorSession:
         if self.stopped:
             raise InteractiveValidationError("session is already stopped")
         actions = self.validator.validate(values)
-        evidence_before_chunk = len(self.evidence)
         helper = ToolExecutor(
             retriever=self.retriever,
             raw_inspector=self.raw_inspector,
             max_raw_inspections=self.max_raw_inspections,
         )
+        evidence_signatures_before_chunk = set(
+            _evidence_signature(self.evidence)
+        )
         for action in actions:
             before = len(self.pool)
-            evidence_before = len(self.evidence)
+            evidence_signatures_before = set(_evidence_signature(self.evidence))
             step_error = ""
             try:
                 if action.tool == "FILTER":
                     self.pool = helper._filter(self.pool, **action.arguments)
                     self.pool_observable = True
+                    self._refresh_evidence_from_pool()
                 elif action.tool == "SORT":
                     self.pool = helper._sort(self.pool, **action.arguments)
                     self.pool_observable = True
+                    self._refresh_evidence_from_pool()
                 elif action.tool == "TOPK":
                     self.pool = helper._topk_turns(
                         self.pool,
                         action.arguments["k"],
                     )
                     self.pool_observable = True
+                    self._refresh_evidence_from_pool()
                 elif action.tool == "RETRIEVE":
                     source = (
                         self.memory_store.initial_pool()
@@ -663,6 +652,7 @@ class ExecutorSession:
                         question_image=self.question_image,
                     )
                     self.pool_observable = True
+                    self._refresh_evidence_from_pool()
                 elif action.tool == "EXPAND_NEIGHBORS":
                     if not self.pool_observable:
                         raise InteractiveValidationError(
@@ -671,10 +661,7 @@ class ExecutorSession:
                     self.pool = self._expand_neighbors(
                         action.arguments["window"]
                     )
-                elif action.tool == "READ":
-                    self._append_evidence(
-                        helper._read(self.pool, action.arguments["fields"])
-                    )
+                    self._refresh_evidence_from_pool()
                 elif action.tool == "INSPECT_RAW":
                     remaining = max(
                         0,
@@ -700,14 +687,18 @@ class ExecutorSession:
                     action=action,
                     pool_before=before,
                     pool_after=len(self.pool),
-                    evidence_added=len(self.evidence) - evidence_before,
+                    evidence_added=len(
+                        set(_evidence_signature(self.evidence))
+                        - evidence_signatures_before
+                    ),
                     error=step_error,
                 )
             )
             if self.stopped or step_error:
                 break
-        self.last_chunk_new_evidence_count = (
-            len(self.evidence) - evidence_before_chunk
+        self.last_chunk_new_evidence_count = len(
+            set(_evidence_signature(self.evidence))
+            - evidence_signatures_before_chunk
         )
         return self.observation()
 
@@ -725,6 +716,38 @@ class ExecutorSession:
             if signature not in existing:
                 self.evidence.append(item)
                 existing.add(signature)
+
+    def _pool_to_evidence(self) -> List[EvidenceItem]:
+        evidence: List[EvidenceItem] = []
+        for item in self.pool:
+            values = {
+                field: item.memory.field_value(field)
+                for field in DEFAULT_EVIDENCE_FIELDS
+            }
+            if "session_date" not in values:
+                values["session_date"] = item.memory.metadata.get(
+                    "session_date"
+                )
+            if item.score:
+                values["retrieval_score"] = item.score
+            evidence.append(
+                EvidenceItem(
+                    memory_id=item.memory.memory_id,
+                    fields=values,
+                    source="MEMORY",
+                )
+            )
+        return evidence
+
+    def _refresh_evidence_from_pool(self) -> None:
+        pool_ids = {item.memory.memory_id for item in self.pool}
+        raw_evidence = [
+            item
+            for item in self.evidence
+            if item.source == "INSPECT_RAW" and item.memory_id in pool_ids
+        ]
+        self.evidence = self._pool_to_evidence()
+        self._append_evidence(raw_evidence)
 
     def _expand_neighbors(self, window: int) -> List[PoolItem]:
         selected = {
@@ -822,6 +845,9 @@ class ExecutorSession:
             stopped=self.stopped,
             last_error=self.error,
             has_question_image=bool(self.question_image),
+            has_visual_candidates=any(
+                item.memory.modality == "image" for item in visible_pool
+            ),
         )
 
     def result(self) -> ExecutionResult:
@@ -865,6 +891,28 @@ class VerificationResult:
         }
         if self.diagnostic:
             feedback["failure_diagnostic"] = self.diagnostic
+        elif not self.answerable:
+            feedback["failure_diagnostic"] = {
+                "failure_type": (
+                    "validation_error"
+                    if self.error
+                    else "insufficient_evidence"
+                ),
+                "evidence_gap": (
+                    _clip_text(self.reason, 240)
+                    if self.reason
+                    else "The current evidence is not sufficient to support a correct answer."
+                ),
+                "recommended_change": (
+                    "Change the retrieval method or query focus, narrow or expand the current evidence pool, or inspect relevant raw images if visual details are missing."
+                ),
+                "recommended_tool": "RETRIEVE",
+                "recommended_retrieval_method": "hybrid",
+                "needs_text_evidence": True,
+                "needs_visual_evidence": False,
+                "needs_neighbor_context": False,
+                "avoid_action": "STOP",
+            }
         return feedback
 
     def to_dict(self, include_reason: bool = True) -> Dict[str, Any]:
@@ -889,6 +937,41 @@ class EvidenceVerifier(Protocol):
         evidence: List[EvidenceItem],
     ) -> VerificationResult:
         ...
+
+
+def verification_from_answer_validation(
+    answer_validation: "AnswerValidationResult",
+    evidence: List[EvidenceItem],
+    *,
+    can_inspect_raw: bool = False,
+) -> VerificationResult:
+    redundancy = InteractiveTeacherSearch._evidence_redundancy(evidence)
+    if answer_validation.correct:
+        return VerificationResult(
+            answerable=True,
+            relevance=1.0,
+            completeness=1.0,
+            redundancy=redundancy,
+            reason=answer_validation.reason,
+        )
+
+    diagnostic = answer_validation.failure_feedback(
+        evidence,
+        can_inspect_raw=can_inspect_raw,
+    )
+    partial_score = max(0.0, min(0.49, float(answer_validation.score)))
+    return VerificationResult(
+        answerable=False,
+        relevance=partial_score,
+        completeness=partial_score,
+        redundancy=redundancy,
+        reason=(
+            "Answer-model evidence assessment failed: "
+            + (answer_validation.reason or answer_validation.error)
+        ),
+        error=answer_validation.error,
+        diagnostic=diagnostic,
+    )
 
 
 @dataclass
@@ -928,12 +1011,12 @@ class AnswerValidationResult:
         )
         if not evidence:
             failure_type = "no_evidence"
-            evidence_gap = "No evidence has been read for the answer model."
+            evidence_gap = "No evidence has been retrieved for the answer model."
             recommended_change = (
-                "Retrieve a focused candidate pool, then READ relevant fields."
+                "Retrieve a focused evidence pool."
             )
             action_hints: Dict[str, Any] = {
-                "recommended_tool": "READ_OR_RETRIEVE",
+                "recommended_tool": "RETRIEVE",
                 "needs_text_evidence": True,
                 "needs_visual_evidence": False,
                 "avoid_action": "STOP",
@@ -979,8 +1062,7 @@ class AnswerValidationResult:
             )
             recommended_change = self.diagnostic.get(
                 "recommended_change",
-                "Change the retrieval query or candidate pool, then read the "
-                "new evidence.",
+                "Change the retrieval query or current evidence pool.",
             )
             action_hints = {
                 key: value
@@ -1019,7 +1101,7 @@ class AnswerValidationResult:
             )
             recommended_change = (
                 "Reformulate retrieval, change retrieval method, or expand "
-                "neighboring turns before reading again."
+                "neighboring turns."
             )
             action_hints = {
                 "recommended_tool": "RETRIEVE",
@@ -1385,7 +1467,7 @@ def build_simple_student_policy_prompt(
         else "1-3 tool actions"
     )
     action_shape = (
-        "[{\"tool\":\"READ\",\"fields\":[\"summary\"]}]"
+        "[{\"tool\":\"RETRIEVE\",\"method\":\"bm25\",\"top_k\":5,\"scope\":\"all\"}]"
         if "exactly one executable action" in schema
         else "[{\"tool\":\"RETRIEVE\",\"method\":\"hybrid\",\"top_k\":5,\"scope\":\"all\"}]"
     )
@@ -1418,28 +1500,21 @@ def build_compact_interactive_schema(allow_inspect_raw: bool = False) -> str:
     tools = [
         (
             "RETRIEVE(method=bm25|dense|vision|hybrid, top_k, query?, scope?): "
-            "search memory and replace/extend the candidate pool; it does NOT "
-            "add answer evidence"
-        ),
-        (
-            "READ(fields): read text and metadata from the current candidate "
-            "pool into answer evidence"
+            "search memory and replace/extend the current evidence pool"
         ),
         (
             "EXPAND_NEIGHBORS(window): add nearby turns around current "
-            "candidates to recover surrounding context; it does NOT read them"
+            "evidence to recover surrounding context"
         ),
         (
-            "FILTER(field, op, value): narrow the current candidate pool by "
-            "metadata; it does NOT add evidence"
+            "FILTER(field, op, value): narrow the current evidence pool by "
+            "metadata"
         ),
         (
-            "SORT(field, order): reorder the current candidate pool; it does "
-            "NOT add evidence"
+            "SORT(field, order): reorder the current evidence pool"
         ),
         (
-            "TOPK(k): keep only the first k current candidates; it does NOT "
-            "add evidence"
+            "TOPK(k): keep only the first k current evidence turns"
         ),
     ]
     if allow_inspect_raw:
@@ -1449,7 +1524,7 @@ def build_compact_interactive_schema(allow_inspect_raw: bool = False) -> str:
         )
     tools.append(
         "STOP(): finish only when the accumulated evidence is sufficient to "
-        "answer; STOP does not retrieve or read anything"
+        "answer; STOP does not retrieve anything"
     )
     return "\n".join(f"- {tool}" for tool in tools)
 
@@ -1528,6 +1603,7 @@ def _planner_observation_state(
         "stopped": observation.stopped,
         "last_error": _clip_text(observation.last_error, 120),
         "has_question_image": observation.has_question_image,
+        "has_visual_candidates": observation.has_visual_candidates,
     }
 
 
@@ -1555,15 +1631,15 @@ def build_compact_planner_prompt(
         else "1-3 actions each"
     )
     retrieve_guidance = (
-        "- RETRIEVE alone cannot support an answer. If you retrieve now, the "
-        "next observation must be used to decide whether to READ, filter, "
-        "inspect, or search again."
+        "- RETRIEVE directly replaces the current evidence pool. After a "
+        "retrieval, decide from the new observation whether to filter/sort, "
+        "expand neighbors, inspect raw images, search differently, or stop."
         if atomic
         else (
-            "- RETRIEVE alone cannot support an answer. Usually follow a "
-            "useful retrieval with READ in the same chunk. If the missing "
-            "evidence is visual, use INSPECT_RAW; if the missing evidence "
-            "may be in nearby dialogue turns, use EXPAND_NEIGHBORS then READ."
+            "- RETRIEVE directly replaces the current evidence pool. If the "
+            "new pool is broad, pair retrieval with FILTER/SORT/TOPK. If "
+            "surrounding dialogue may contain missing context, use "
+            "EXPAND_NEIGHBORS. If visual details are missing, use INSPECT_RAW."
         )
     )
     final_shape = (
@@ -1575,11 +1651,10 @@ def build_compact_planner_prompt(
         else (
             '{"candidates":[{"diagnosis":"why this chunk addresses the '
             'current feedback","next_tool":"RETRIEVE","expected_gain":"find '
-            'and read a focused candidate pool","actions":[{"tool":'
+            'a focused evidence pool","actions":[{"tool":'
             '"RETRIEVE","method":"vision","top_k":5,"scope":"all"},'
-            '{"tool":"READ","fields":["summary","content","timestamp",'
-            '"session_date","turn_id","author","modality",'
-            '"source_type","raw_pointer"]}]}]}'
+            '{"tool":"INSPECT_RAW","target":"current_pool",'
+            '"instruction":"answer_query_related_visual_details"}]}]}'
         )
     )
     return f"""Return a memory-tool policy JSON.
@@ -1592,7 +1667,7 @@ Tools:
 
 Constraints:
 - {max(1, candidate_count)} candidates; {action_limit}.
-- Pool-changing actions before READ/INSPECT_RAW.
+- Pool-changing actions before INSPECT_RAW.
 - Analyze the query before choosing RETRIEVE.method.
 - Use bm25 for exact names, IDs, dates, quoted phrases, or distinctive words.
 - Use dense for semantic text memory when wording may differ.
@@ -1603,15 +1678,14 @@ Constraints:
 - Use hybrid when both text/caption clues and visual evidence are useful, or
   when unsure which route should dominate.
 {retrieve_guidance}
-- If candidates exist but evidence is empty, read or inspect them instead of
-  repeating the same retrieval.
-- If the candidate pool changed but evidence.new is 0, the new candidates have
-  not been used as evidence yet. Prefer READ; if surrounding dialogue is needed,
-  use EXPAND_NEIGHBORS then READ.
-- Do not STOP while relevant candidates remain unread or uninspected.
+- If evidence exists but is off-topic, change retrieval method/query/scope
+  rather than stopping.
+- If surrounding dialogue is needed, use EXPAND_NEIGHBORS.
+- Do not STOP while the current evidence is insufficient or only visual/textual
+  half of the problem is covered.
 - No memory IDs or file paths.
 - If fb says visual/image gap, use INSPECT_RAW.
-- If fb says text/context/date/person relation is missing after a READ,
+- If fb says text/context/date/person relation is missing,
   consider EXPAND_NEIGHBORS, FILTER, SORT, or a different retrieval route
   instead of another similar RETRIEVE.
 
@@ -1622,18 +1696,18 @@ Answer-model feedback:
   most directly addresses fb.failure_diagnostic.evidence_gap.
 - If fb.failure_diagnostic has recommended_tool, make at least one candidate
   follow that tool unless the observation makes it impossible.
-- If recommended_tool is READ, read the current candidate pool instead of
-  retrieving again. If it is INSPECT_RAW, inspect current visual candidates. If
-  it is RETRIEVE, change the retrieval method, query focus, scope, or top_k so
-  the attempt is not a repeat of last_retrieval. If it is EXPAND_NEIGHBORS,
-  recover surrounding turns before reading. If it names STOP, stop only when
-  fb says the evidence is answerable.
-- If fb.failure_diagnostic.failure_type is unread_candidate_pool, use READ
-  now; do not retrieve again before reading the current pool.
+- If recommended_tool is INSPECT_RAW, inspect current visual candidates. If it
+  is RETRIEVE, change the retrieval method, query focus, scope, or top_k so the
+  attempt is not a repeat of last_retrieval. If it is EXPAND_NEIGHBORS, recover
+  surrounding turns. If it names FILTER/SORT/TOPK, narrow or reorder the current
+  evidence pool. If it names STOP, stop only when fb says the evidence is
+  answerable.
+- If old feedback names READ, treat it as a request to use the current evidence:
+  if it is insufficient, retrieve/filter/sort/expand/inspect instead.
 - Respect avoid_action as a warning about a repeated or unhelpful move.
 - Treat repeated failure as a signal to switch tools. For example, after a
   failed semantic search try bm25/vision/hybrid with a focused query; after
-  reading a plausible memory but missing chronology, expand neighbors or sort
+  finding a plausible memory but missing chronology, expand neighbors or sort
   by time; after seeing image candidates but lacking visual confirmation,
   inspect raw images.
 
@@ -1648,16 +1722,16 @@ Planning guidance:
   concept in a focused query, changing retrieval breadth or method, exploring
   neighboring turns, or inspecting relevant raw images.
 - In chunk mode, prefer a compact repair plan over a single habitual action:
-  retrieve+read for a new pool, expand+read for surrounding context,
-  filter/sort+read for narrowing or temporal questions, inspect_raw for
-  visual verification. Keep the chunk short and purposeful.
+  retrieve for a new pool, expand for surrounding context, filter/sort/topk for
+  narrowing or temporal questions, inspect_raw for visual verification. Keep
+  the chunk short and purposeful.
 - Use FILTER when the current pool already contains plausible candidates but
   must be narrowed by author/person, modality, source_type, date/session, or a
-  distinctive text value; usually follow FILTER with READ.
+  distinctive text value.
 - Use SORT for before/after, latest/earliest, timeline, first/last, or other
-  chronology questions; sort by timestamp/turn_id, optionally TOPK, then READ.
+  chronology questions; sort by timestamp/turn_id, optionally TOPK.
 - Use TOPK after FILTER or SORT when the pool is broad and only the strongest
-  or temporally relevant candidates should be read.
+  or temporally relevant candidates should remain as evidence.
 - Candidate metadata and executable actions must agree. If next_tool says a
   more targeted search or broader context is needed, the action parameters
   should visibly implement that change.
@@ -1730,7 +1804,7 @@ def fallback_action_chunks(
     """General recovery actions derived only from online executor state."""
     candidates: List[List[ToolAction]] = []
     if validator.max_chunk_actions == 1:
-        if not observation.candidate_previews:
+        if observation.evidence_count == 0:
             candidates.append(
                 [
                     ToolAction(
@@ -1739,12 +1813,16 @@ def fallback_action_chunks(
                     )
                 ]
             )
-        elif observation.evidence_count == 0:
-            candidates.append(
-                [ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)})]
-            )
         else:
-            if validator.allow_inspect_raw:
+            has_raw_evidence = any(
+                item.get("source") == "INSPECT_RAW"
+                for item in observation.evidence_previews
+            )
+            if (
+                validator.allow_inspect_raw
+                and observation.has_visual_candidates
+                and not has_raw_evidence
+            ):
                 candidates.append(raw_inspect_chunk())
             candidates.append(
                 [ToolAction("EXPAND_NEIGHBORS", {"window": 1})]
@@ -1758,34 +1836,24 @@ def fallback_action_chunks(
                 continue
         return validated[: max(1, candidate_count)]
 
-    if not observation.candidate_previews:
+    if observation.evidence_count == 0:
         candidates.append(
             [
                 ToolAction(
                     "RETRIEVE",
                     {"method": "hybrid", "top_k": 5, "scope": "all"},
                 ),
-                ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)}),
-            ]
-        )
-    elif observation.evidence_count == 0:
-        candidates.append(
-            [ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)})]
-        )
-        candidates.append(
-            [
-                ToolAction("EXPAND_NEIGHBORS", {"window": 1}),
-                ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)}),
             ]
         )
         if validator.allow_inspect_raw:
             candidates.append(raw_inspect_chunk())
     else:
+        has_raw_evidence = any(
+            item.get("source") == "INSPECT_RAW"
+            for item in observation.evidence_previews
+        )
         candidates.append(
-            [
-                ToolAction("EXPAND_NEIGHBORS", {"window": 1}),
-                ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)}),
-            ]
+            [ToolAction("EXPAND_NEIGHBORS", {"window": 1})]
         )
         candidates.append(
             [
@@ -1793,10 +1861,13 @@ def fallback_action_chunks(
                     "RETRIEVE",
                     {"method": "hybrid", "top_k": 10, "scope": "all"},
                 ),
-                ToolAction("READ", {"fields": list(DEFAULT_READ_FIELDS)}),
             ]
         )
-        if validator.allow_inspect_raw:
+        if (
+            validator.allow_inspect_raw
+            and observation.has_visual_candidates
+            and not has_raw_evidence
+        ):
             candidates.append(raw_inspect_chunk())
     validated = []
     for candidate in candidates:
@@ -2056,14 +2127,43 @@ class InteractiveDecision:
         )
 
 
+def initial_search_feedback() -> VerificationResult:
+    return VerificationResult(
+        answerable=False,
+        relevance=0.0,
+        completeness=0.0,
+        redundancy=0.0,
+        reason=(
+            "No retrieval action has been executed yet; the planner must create "
+            "an initial evidence pool."
+        ),
+        diagnostic={
+            "failure_type": "no_evidence",
+            "evidence_gap": "No evidence pool has been retrieved for this query yet.",
+            "recommended_change": (
+                "Choose an initial retrieval method based on the query: bm25 for "
+                "names/dates/exact terms, dense for paraphrased text memory, "
+                "vision for visual matching, or hybrid when mixed."
+            ),
+            "recommended_tool": "RETRIEVE",
+            "recommended_retrieval_method": "hybrid",
+            "needs_text_evidence": True,
+            "needs_visual_evidence": False,
+            "needs_neighbor_context": False,
+            "avoid_action": "STOP",
+        },
+    )
+
+
 @dataclass
 class SearchNode:
     session: ExecutorSession
     decisions: List[InteractiveDecision] = field(default_factory=list)
     verification: VerificationResult = field(
-        default_factory=lambda: VerificationResult(False, 0.0, 0.0, 0.0)
+        default_factory=initial_search_feedback
     )
     answer_validation: Optional[AnswerValidationResult] = None
+    feedback_available: bool = False
 
     def score(
         self,
@@ -2074,7 +2174,6 @@ class SearchNode:
         raw_evidence = sum(
             1 for item in self.session.evidence if item.source == "INSPECT_RAW"
         )
-        no_op_reads = self._redundant_read_count()
         answer_score = (
             float(self.answer_validation.score)
             if self.answer_validation is not None
@@ -2096,30 +2195,8 @@ class SearchNode:
             self.verification.relevance,
             -self.verification.redundancy,
             min(raw_evidence, 3),
-            -no_op_reads,
             -len(self.session.history),
         )
-
-    def _redundant_read_count(self) -> int:
-        reads = []
-        pool_fingerprint = ""
-        count = 0
-        for step in self.session.steps:
-            action = step.action
-            if action.tool in POOL_MUTATING_TOOLS:
-                pool_fingerprint = f"{step.index}:{step.pool_after}"
-            if action.tool != "READ":
-                continue
-            signature = (
-                pool_fingerprint,
-                tuple(action.arguments.get("fields", [])),
-                step.evidence_added,
-            )
-            if signature in reads:
-                count += 1
-            reads.append(signature)
-        return count
-
 
 @dataclass
 class InteractiveSearchResult:
@@ -2320,83 +2397,16 @@ class InteractiveTeacherSearch:
             evidence,
             question_image=question_image,
         )
-        if answer_validation.correct:
-            return (
-                VerificationResult(
-                    answerable=True,
-                    relevance=1.0,
-                    completeness=1.0,
-                    redundancy=redundancy,
-                    reason=answer_validation.reason,
-                ),
-                answer_validation,
-            )
-
-        diagnostic = answer_validation.failure_feedback(
-            evidence,
-            can_inspect_raw=(
-                self.validator.allow_inspect_raw
-                and self.raw_inspector is not None
-            ),
-        )
-        partial_score = max(0.0, min(0.49, float(answer_validation.score)))
         return (
-            VerificationResult(
-                answerable=False,
-                relevance=partial_score,
-                completeness=partial_score,
-                redundancy=redundancy,
-                reason=(
-                    "Answer-model evidence assessment failed: "
-                    + (answer_validation.reason or answer_validation.error)
-                ),
-                error=answer_validation.error,
-                diagnostic=diagnostic,
-            ),
-            answer_validation,
-        )
-
-    def _unread_candidate_pool_verification(
-        self,
-        session: ExecutorSession,
-    ) -> VerificationResult:
-        """Executor-level feedback when retrieval changed pool but not evidence."""
-        has_visual_candidates = any(
-            item.memory.modality == "image" for item in session.pool[:8]
-        )
-        return VerificationResult(
-            answerable=False,
-            relevance=0.0,
-            completeness=0.0,
-            redundancy=self._evidence_redundancy(session.evidence),
-            reason=(
-                "The candidate pool changed, but no new evidence was read. "
-                "The answer validator cannot assess newly retrieved candidates "
-                "until READ or INSPECT_RAW adds evidence."
-            ),
-            diagnostic={
-                "failure_type": "unread_candidate_pool",
-                "evidence_gap": (
-                    "New candidate memories are available but have not been "
-                    "converted into answer evidence."
-                ),
-                "recommended_change": (
-                    "Read the current candidate pool before another retrieval. "
-                    "If the relevant fact may be in nearby dialogue context, "
-                    "expand neighbors and then read."
-                ),
-                "recommended_tool": "READ",
-                "needs_text_evidence": True,
-                "needs_visual_evidence": bool(
-                    has_visual_candidates
-                    and self.validator.allow_inspect_raw
+            verification_from_answer_validation(
+                answer_validation,
+                evidence,
+                can_inspect_raw=(
+                    self.validator.allow_inspect_raw
                     and self.raw_inspector is not None
                 ),
-                "needs_neighbor_context": False,
-                "avoid_action": (
-                    "Another RETRIEVE before reading the current candidate pool."
-                ),
-            },
+            ),
+            answer_validation,
         )
 
     def search(
@@ -2406,6 +2416,7 @@ class InteractiveTeacherSearch:
         memory_store: HiddenMemoryStore,
         question_image: Optional[str] = None,
         initial_session: Optional[ExecutorSession] = None,
+        initial_verification: Optional[VerificationResult] = None,
     ) -> InteractiveSearchResult:
         initial = (
             initial_session.clone()
@@ -2424,7 +2435,13 @@ class InteractiveTeacherSearch:
             raise ValueError(
                 "initial_session must belong to the current query and store"
             )
-        beam = [SearchNode(session=initial)]
+        beam = [
+            SearchNode(
+                session=initial,
+                verification=initial_verification or initial_search_feedback(),
+                feedback_available=initial_verification is not None,
+            )
+        ]
         finished: List[SearchNode] = []
         candidates_evaluated = 0
         failure_diagnostics: List[Dict[str, Any]] = []
@@ -2447,7 +2464,7 @@ class InteractiveTeacherSearch:
                 observation = node.session.observation()
                 feedback = (
                     node.verification.planner_feedback()
-                    if node.decisions
+                    if node.decisions or node.feedback_available
                     else None
                 )
                 try:
@@ -2503,9 +2520,6 @@ class InteractiveTeacherSearch:
                     evidence_changed = _evidence_signature(
                         child_session.evidence
                     ) != _evidence_signature(node.session.evidence)
-                    pool_changed = _pool_signature(
-                        child_session.pool
-                    ) != _pool_signature(node.session.pool)
                     if evidence_changed:
                         validation_started = time.perf_counter()
                         verification, answer_validation = (
@@ -2519,16 +2533,6 @@ class InteractiveTeacherSearch:
                         answer_validator_seconds += (
                             time.perf_counter() - validation_started
                         )
-                    elif (
-                        pool_changed
-                        and child_session.pool_observable
-                        and child_session.pool
-                    ):
-                        validation_cache_hits += 1
-                        verification = self._unread_candidate_pool_verification(
-                            child_session
-                        )
-                        answer_validation = node.answer_validation
                     else:
                         validation_cache_hits += 1
                         verification = node.verification
@@ -2586,6 +2590,7 @@ class InteractiveTeacherSearch:
                         decisions=[*node.decisions, decision],
                         verification=verification,
                         answer_validation=answer_validation,
+                        feedback_available=True,
                     )
                     if child_session.stopped:
                         finished.append(child)
@@ -2622,6 +2627,7 @@ class InteractiveTeacherSearch:
                                 ],
                                 verification=verification,
                                 answer_validation=answer_validation,
+                                feedback_available=True,
                             )
                         )
                     elif len(child_session.evidence) <= self.max_evidence:
